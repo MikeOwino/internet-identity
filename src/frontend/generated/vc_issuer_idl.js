@@ -1,7 +1,17 @@
 export const idlFactory = ({ IDL }) => {
   const IssuerConfig = IDL.Record({
+    'derivation_origin' : IDL.Text,
     'idp_canister_ids' : IDL.Vec(IDL.Principal),
-    'ic_root_key_der' : IDL.Vec(IDL.Nat8),
+    'ic_root_key_der' : IDL.Opt(IDL.Vec(IDL.Nat8)),
+    'frontend_hostname' : IDL.Text,
+  });
+  const DerivationOriginRequest = IDL.Record({
+    'frontend_hostname' : IDL.Text,
+  });
+  const DerivationOriginData = IDL.Record({ 'origin' : IDL.Text });
+  const DerivationOriginError = IDL.Variant({
+    'Internal' : IDL.Text,
+    'UnsupportedOrigin' : IDL.Text,
   });
   const SignedIdAlias = IDL.Record({ 'credential_jws' : IDL.Text });
   const ArgumentValue = IDL.Variant({ 'Int' : IDL.Int32, 'String' : IDL.Text });
@@ -66,6 +76,16 @@ export const idlFactory = ({ IDL }) => {
     'add_employee' : IDL.Func([IDL.Principal], [IDL.Text], []),
     'add_graduate' : IDL.Func([IDL.Principal], [IDL.Text], []),
     'configure' : IDL.Func([IssuerConfig], [], []),
+    'derivation_origin' : IDL.Func(
+        [DerivationOriginRequest],
+        [
+          IDL.Variant({
+            'Ok' : DerivationOriginData,
+            'Err' : DerivationOriginError,
+          }),
+        ],
+        [],
+      ),
     'get_credential' : IDL.Func(
         [GetCredentialRequest],
         [
@@ -87,6 +107,8 @@ export const idlFactory = ({ IDL }) => {
         ],
         [],
       ),
+    'set_alternative_origins' : IDL.Func([IDL.Text], [], []),
+    'set_derivation_origin' : IDL.Func([IDL.Text, IDL.Text], [], []),
     'vc_consent_message' : IDL.Func(
         [Icrc21VcConsentMessageRequest],
         [IDL.Variant({ 'Ok' : Icrc21ConsentInfo, 'Err' : Icrc21Error })],
@@ -96,8 +118,10 @@ export const idlFactory = ({ IDL }) => {
 };
 export const init = ({ IDL }) => {
   const IssuerConfig = IDL.Record({
+    'derivation_origin' : IDL.Text,
     'idp_canister_ids' : IDL.Vec(IDL.Principal),
-    'ic_root_key_der' : IDL.Vec(IDL.Nat8),
+    'ic_root_key_der' : IDL.Opt(IDL.Vec(IDL.Nat8)),
+    'frontend_hostname' : IDL.Text,
   });
   return [IDL.Opt(IssuerConfig)];
 };

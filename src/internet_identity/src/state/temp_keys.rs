@@ -17,14 +17,14 @@ pub struct TempKeys {
     ///
     /// Note: we link the temporary keys to a device so that we can make sure the temporary key is dropped
     /// if the device itself is removed. This ensures the temporary key is no more powerful than the device,
-    /// i.e. if the user decides to remove the device right after registration, then the the temporary key
+    /// i.e. if the user decides to remove the device right after registration, then the temporary key
     /// cannot be used to authenticate (similarly to how the browser session key pair cannot be used to
     /// authenticate if the actual delegated WebAuthn device is removed).
     ///
     /// In addition, the temporary key is also linked to an anchor so that even if the same device is
     /// added to multiple anchors, it can only be used in the context of the anchor it was created for.
     ///
-    /// Since temp keys can only be added during registration, the the max number of temp keys is
+    /// Since temp keys can only be added during registration, the max number of temp keys is
     /// bounded by the registration rate limit.
     temp_keys: HashMap<(AnchorNumber, DeviceKey), TempKey>,
 
@@ -107,7 +107,7 @@ impl TempKeys {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TempKey {
+struct TempKey {
     /// The temp key principal
     principal: Principal,
     /// The expiration timestamp of the temp key
@@ -115,9 +115,9 @@ pub struct TempKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TempKeyExpiration {
+struct TempKeyExpiration {
     /// Key with which to find the temp key in the `temp_keys` map
-    pub key: (AnchorNumber, DeviceKey),
+    key: (AnchorNumber, DeviceKey),
     /// The expiration timestamp of the temp key
-    pub expiration: Timestamp,
+    expiration: Timestamp,
 }

@@ -4,10 +4,11 @@ import {
 } from "$generated/internet_identity_types";
 import { displayError } from "$src/components/displayError";
 import { withLoader } from "$src/components/loader";
+import { tentativeDeviceStepper } from "$src/flows/addDevice/stepper";
 import { AuthenticatedConnection } from "$src/utils/iiConnection";
 import { isNullish } from "@dfinity/utils";
-import { addDeviceSuccess } from "./addDeviceSuccess";
-import { addFIDODevice } from "./addFIDODevice";
+import { addDeviceSuccess } from "../addDeviceSuccess";
+import { addCurrentDevice } from "./addCurrentDevice";
 import { pollForTentativeDevice } from "./pollForTentativeDevice";
 import { verifyTentativeDevice } from "./verifyTentativeDevice";
 
@@ -50,7 +51,7 @@ export const addDevice = async ({
       // If the user wants to add a FIDO device then we can (should) exit registration mode
       // (only used for adding extra browsers)
       await withLoader(() => connection.exitDeviceRegistrationMode());
-      await addFIDODevice(userNumber, connection, anchorInfo.devices);
+      await addCurrentDevice(userNumber, connection, anchorInfo.devices);
       return;
     } else if (result === "canceled") {
       // If the user canceled, disable registration mode and return
@@ -70,6 +71,10 @@ export const addDevice = async ({
   });
 
   if (result === "verified") {
-    await addDeviceSuccess({ deviceAlias: alias });
+    await addDeviceSuccess({
+      userNumber,
+      deviceAlias: alias,
+      stepper: tentativeDeviceStepper({ step: "success" }),
+    });
   }
 };

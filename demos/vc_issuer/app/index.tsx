@@ -40,6 +40,11 @@ const App = () => {
     }
   };
 
+  // The derivation origin to use for authentication
+  const [derivationOrigin, setDerivationOrigin] = useState<string | undefined>(
+    undefined
+  );
+
   // The principal, set during auth
   const [principal, setPrincipal] = useState<string | undefined>(undefined);
 
@@ -57,6 +62,7 @@ const App = () => {
       await new Promise<void>((resolve, reject) => {
         authClient.login({
           identityProvider: iiUrl,
+          derivationOrigin,
           onSuccess: () => resolve(),
           onError: reject,
         });
@@ -114,6 +120,26 @@ const App = () => {
             type="text"
             value={iiUrl}
             onChange={(evt) => setIiUrl(evt.target.value)}
+          />
+        </label>
+      </section>
+      <section>
+        <label>
+          Custom principal:
+          <input
+            data-role="custom-principal"
+            type="text"
+            onChange={(evt) => setPrincipal(evt.target.value)}
+          />
+        </label>
+      </section>
+      <section>
+        <label>
+          Derivation origin (for authentication):
+          <input
+            data-role="derivation-origin"
+            type="text"
+            onChange={(evt) => setDerivationOrigin(evt.target.value)}
           />
         </label>
       </section>

@@ -1,10 +1,11 @@
 import { DeviceData } from "$generated/internet_identity_types";
 import { features } from "$src/features";
 import {
-  creationOptions,
   DummyIdentity,
   IIWebAuthnIdentity,
+  creationOptions,
 } from "$src/utils/iiConnection";
+import { diagnosticInfo, unknownToString } from "$src/utils/utils";
 import { WebAuthnIdentity } from "@dfinity/identity";
 import { isNullish } from "@dfinity/utils";
 
@@ -24,5 +25,14 @@ export const constructIdentity = async ({
     ? () => Promise.resolve(new DummyIdentity())
     : () => WebAuthnIdentity.create({ publicKey: opts });
 
-  return createIdentity();
+  try {
+    return createIdentity();
+  } catch (e: unknown) {
+    throw new Error(
+      `Failed to create passkey: ${unknownToString(
+        e,
+        "unknown error"
+      )}, ${await diagnosticInfo()}`
+    );
+  }
 };

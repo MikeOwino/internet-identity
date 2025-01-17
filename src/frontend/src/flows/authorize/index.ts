@@ -1,28 +1,29 @@
 import {
-  authenticateBox,
   AuthnTemplates,
+  authenticateBox,
 } from "$src/components/authenticateBox";
 import { displayError } from "$src/components/displayError";
 import { caretDownIcon } from "$src/components/icons";
 import { withLoader } from "$src/components/loader";
 import { showMessage } from "$src/components/message";
 import { showSpinner } from "$src/components/spinner";
+import { DOMAIN_COMPATIBILITY } from "$src/featureFlags";
 import { getDapps } from "$src/flows/dappsExplorer/dapps";
 import { recoveryWizard } from "$src/flows/recovery/recoveryWizard";
 import { I18n } from "$src/i18n";
-import { setKnownPrincipal } from "$src/storage";
+import { getAnchorIfLastUsed, setKnownPrincipal } from "$src/storage";
 import { Connection } from "$src/utils/iiConnection";
 import { TemplateElement } from "$src/utils/lit-html";
 import { Chan } from "$src/utils/utils";
 import { Principal } from "@dfinity/principal";
-import { html, TemplateResult } from "lit-html";
-import { asyncReplace } from "lit-html/directives/async-replace.js";
-import { Delegation, fetchDelegation } from "./fetchDelegation";
-import { AuthContext, authenticationProtocol } from "./postMessageInterface";
-import { validateDerivationOrigin } from "./validateDerivationOrigin";
-
 import { nonNullish } from "@dfinity/utils";
+import { TemplateResult, html } from "lit-html";
+import { asyncReplace } from "lit-html/directives/async-replace.js";
+import { validateDerivationOrigin } from "../../utils/validateDerivationOrigin";
+import { addCurrentDeviceScreen } from "../addDevice/addCurrentDevice";
+import { Delegation, fetchDelegation } from "./fetchDelegation";
 import copyJson from "./index.json";
+import { AuthContext, authenticationProtocol } from "./postMessageInterface";
 
 /* Template for the authbox when authenticating to a dapp */
 export const authnTemplateAuthorize = ({
@@ -89,7 +90,6 @@ export const authnTemplateAuthorize = ({
           ${name} `
       )}
       ${mkChasm({ message: isAltOriginOf(action) ?? strong(origin) })}
-      <p class="t-lead l-stack">${copy.first_time_subtitle}</p>
     </div>
   `;
 
@@ -97,7 +97,7 @@ export const authnTemplateAuthorize = ({
   const firstTimeUnknown = (action: "pick" | "use_existing" | "first_time") => {
     const altOrigin = isAltOriginOf(action);
     return html`
-      <div class="l-stack">
+      <div>
         ${h1(copy.first_time_create)}
         <p class="t-lead l-stack">${copy.first_time_unknown_subtitle}</p>
         ${nonNullish(altOrigin)
@@ -110,11 +110,12 @@ export const authnTemplateAuthorize = ({
   // Variation: the user has used II before
   const returning = (action: "pick" | "use_existing") => {
     const altOrigin = isAltOriginOf(action);
+    // The "use_existing" screen has a different layout (mainWindow) than the "pick" screen (landingPage).
+    // Ideally the outer space would be handled by the parent.
+    const classAttribute = action === "use_existing" ? 'class="l-stack"' : "";
     return html`
-      <div class="l-stack">
-        ${h1(
-          html`${copy[`${action}_title_1`]}<br />${copy[`${action}_title_2`]}`
-        )}
+      <div ${classAttribute}>
+        ${h1(html`${copy[`${action}_title_1`]}`)}
         <p class="t-lead l-stack">
           ${copy[`${action}_subtitle`]} ${copy[`${action}_subtitle_join`]}
           ${nonNullish(knownDapp)
@@ -156,16 +157,21 @@ const authenticate = async (
   connection: Connection,
   authContext: AuthContext
 ): Promise<
-  | { kind: "success"; delegations: Delegation[]; userPublicKey: Uint8Array }
+  | {
+      kind: "success";
+      delegations: Delegation[];
+      userPublicKey: Uint8Array;
+      authnMethod: "pin" | "passkey" | "recovery";
+    }
   | { kind: "failure"; text: string }
 > => {
   const i18n = new I18n();
   const copy = i18n.i18n(copyJson);
 
-  const validationResult = await validateDerivationOrigin(
-    authContext.requestOrigin,
-    authContext.authRequest.derivationOrigin
-  );
+  const validationResult = await validateDerivationOrigin({
+    requestOrigin: authContext.requestOrigin,
+    derivationOrigin: authContext.authRequest.derivationOrigin,
+  });
 
   if (validationResult.result === "invalid") {
     await displayError({
@@ -182,6 +188,14 @@ const authenticate = async (
     };
   }
 
+  let autoSelectionIdentity = undefined;
+  if (nonNullish(authContext.authRequest.autoSelectionPrincipal)) {
+    autoSelectionIdentity = await getAnchorIfLastUsed({
+      principal: authContext.authRequest.autoSelectionPrincipal,
+      origin: authContext.requestOrigin,
+    });
+  }
+
   const authSuccess = await authenticateBox({
     connection,
     i18n,
@@ -193,14 +207,17 @@ const authenticate = async (
         dapp.hasOrigin(authContext.requestOrigin)
       ),
     }),
+    allowPinLogin: authContext.authRequest.allowPinAuthentication ?? true,
+    // Registration with PIN is not allowed anymore
+    allowPinRegistration: false,
+    autoSelectionIdentity: autoSelectionIdentity,
   });
 
-  // Here, if the user is returning & doesn't have any recovery device, we prompt them to add
-  // one. The exact flow depends on the device they use.
-  // XXX: Must happen before auth protocol is done, otherwise the authenticating dapp
-  // may have already closed the II window
-  if (!authSuccess.newAnchor) {
-    await recoveryWizard(authSuccess.userNumber, authSuccess.connection);
+  if (authSuccess.showAddCurrentDevice && DOMAIN_COMPATIBILITY.isEnabled()) {
+    await addCurrentDeviceScreen(
+      authSuccess.userNumber,
+      authSuccess.connection
+    );
   }
 
   // at this point, derivationOrigin is either validated or undefined
@@ -223,6 +240,17 @@ const authenticate = async (
     };
   }
 
+  // Here, if the user is returning & doesn't have any recovery device, we prompt them to add
+  // one. The exact flow depends on the device they use.
+  // XXX: Must happen before auth protocol is done, otherwise the authenticating dapp
+  // may have already closed the II window
+  if (!authSuccess.newAnchor) {
+    await recoveryWizard(authSuccess.userNumber, authSuccess.connection);
+  }
+
+  // Ignore the response of committing the metadata because it's not crucial.
+  void authSuccess.connection.commitMetadata();
+
   const [userKey, parsed_signed_delegation] = result;
 
   const userPublicKey = Uint8Array.from(userKey);
@@ -238,6 +266,7 @@ const authenticate = async (
     kind: "success",
     delegations: [parsed_signed_delegation],
     userPublicKey: Uint8Array.from(userKey),
+    authnMethod: authSuccess.authnMethod,
   };
 };
 /** Run the authentication flow, including postMessage protocol, offering to authenticate

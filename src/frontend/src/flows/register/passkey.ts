@@ -12,7 +12,6 @@ import {
 } from "$src/utils/webAuthnErrorUtils";
 import { nonNullish } from "@dfinity/utils";
 import { html, TemplateResult } from "lit-html";
-import { registerStepper } from "./stepper";
 
 import copyJson from "./passkey.json";
 
@@ -44,7 +43,6 @@ const savePasskeyTemplate = ({
   `;
 
   const slot = html`
-    ${registerStepper({ current: "create" })}
     <hgroup ${scrollToTop ? mount(() => window.scrollTo(0, 0)) : undefined}>
       <h1 class="t-title t-title--main">${copy.save_passkey}</h1>
       <p class="t-paragraph">
@@ -99,27 +97,36 @@ const savePasskeyTemplate = ({
 export const savePasskeyPage = renderPage(savePasskeyTemplate);
 
 // Prompt the user to create a WebAuthn identity or a PIN identity (if allowed)
-export const savePasskeyOrPin = ({
+export const savePasskeyOrPin = async ({
   pinAllowed,
 }: {
   pinAllowed: boolean;
-}): Promise<IIWebAuthnIdentity | "pin" | "canceled"> => {
-  return new Promise((resolve) =>
-    savePasskeyPage({
-      i18n: new I18n(),
-      cancel: () => resolve("canceled"),
-      scrollToTop: true,
-      constructPasskey: async () => {
-        try {
-          const identity = await withLoader(() => constructIdentity({}));
-          resolve(identity);
-        } catch (e) {
-          toast.error(errorMessage(e));
-        }
-      },
-      constructPin: pinAllowed ? () => resolve("pin") : undefined,
-    })
-  );
+}): Promise<IIWebAuthnIdentity | "pin" | "canceled" | undefined> => {
+  if (pinAllowed) {
+    return new Promise((resolve) => {
+      return savePasskeyPage({
+        i18n: new I18n(),
+        cancel: () => resolve("canceled"),
+        scrollToTop: true,
+        constructPasskey: async () => {
+          try {
+            const identity = await withLoader(() => constructIdentity({}));
+            resolve(identity);
+          } catch (e) {
+            toast.error(errorMessage(e));
+          }
+        },
+        constructPin: pinAllowed ? () => resolve("pin") : undefined,
+      });
+    });
+  }
+  try {
+    const identity = await withLoader(() => constructIdentity({}));
+    return identity;
+  } catch (e) {
+    toast.error(errorMessage(e));
+    return undefined;
+  }
 };
 
 // Return an appropriate error message depending on the (inferred) type of WebAuthn error

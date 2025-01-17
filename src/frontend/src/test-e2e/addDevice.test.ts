@@ -10,8 +10,10 @@ import {
   AddIdentityAnchorView,
   AddRemoteDeviceInstructionsView,
   AddRemoteDeviceVerificationCodeView,
+  AuthenticateView,
   MainView,
   NotInRegistrationModeView,
+  PromptDeviceTrustedView,
   VerifyRemoteDeviceView,
   WelcomeView,
 } from "./views";
@@ -61,6 +63,10 @@ test("Add remote device", async () => {
     await runInBrowser(async (browser2: WebdriverIO.Browser) => {
       await addVirtualAuthenticator(browser2);
       await browser2.url(addDeviceLink);
+
+      const promptDeviceTrustedView = new PromptDeviceTrustedView(browser2);
+      await promptDeviceTrustedView.waitForDisplay();
+      await promptDeviceTrustedView.confirmTrusted();
 
       const verificationCodeView = new AddRemoteDeviceVerificationCodeView(
         browser2
@@ -121,6 +127,10 @@ test("Add remote device starting on new device", async () => {
       await addIdentityAnchorView2.waitForDisplay();
       await addIdentityAnchorView2.continue(userNumber);
 
+      const promptDeviceTrustedView = new PromptDeviceTrustedView(browser2);
+      await promptDeviceTrustedView.waitForDisplay();
+      await promptDeviceTrustedView.confirmTrusted();
+
       const notInRegistrationModeView = new NotInRegistrationModeView(browser2);
       await notInRegistrationModeView.waitForDisplay();
 
@@ -151,6 +161,18 @@ test("Add remote device starting on new device", async () => {
       const addDeviceSuccessView = new AddDeviceSuccessView(browser);
       await addDeviceSuccessView.waitForDisplay();
       await addDeviceSuccessView.continue();
+
+      // browser 2 again
+      const addDeviceSuccessView2 = new AddDeviceSuccessView(browser2);
+      await addDeviceSuccessView2.waitForDisplay();
+      await addDeviceSuccessView2.continue();
+
+      // make sure the browser now shows the sign-in screen with the user number
+      // pre-filled
+      await focusBrowser(browser2);
+      const authView = new AuthenticateView(browser2);
+      await authView.waitForDisplay();
+      await authView.expectAnchor(userNumber);
     });
 
     await mainView.waitForDisplay();

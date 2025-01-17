@@ -1,16 +1,17 @@
-use crate::activity_stats::activity_counter::active_anchor_counter::ActiveAnchorCounter;
-use crate::activity_stats::activity_counter::authn_method_counter::AuthnMethodCounter;
-use crate::activity_stats::activity_counter::domain_active_anchor_counter::DomainActiveAnchorCounter;
-use crate::activity_stats::ActivityStats;
 use crate::archive::{ArchiveData, ArchiveState, ArchiveStatusCache};
+use crate::state::flow_states::FlowStates;
 use crate::state::temp_keys::TempKeys;
+use crate::stats::activity_stats::activity_counter::active_anchor_counter::ActiveAnchorCounter;
+use crate::stats::activity_stats::activity_counter::authn_method_counter::AuthnMethodCounter;
+use crate::stats::activity_stats::activity_counter::domain_active_anchor_counter::DomainActiveAnchorCounter;
+use crate::stats::activity_stats::ActivityStats;
+use crate::stats::event_stats::EventKey;
 use crate::storage::anchor::Anchor;
-use crate::storage::DEFAULT_RANGE_SIZE;
+use crate::storage::MAX_ENTRIES;
 use crate::{random_salt, Storage};
 use asset_util::CertifiedAssets;
 use candid::{CandidType, Deserialize};
-use canister_sig_util::signature_map::SignatureMap;
-use ic_cdk::api::time;
+use ic_canister_sig_creation::signature_map::SignatureMap;
 use ic_cdk::trap;
 use ic_stable_structures::DefaultMemoryImpl;
 use internet_identity_interface::internet_identity::types::*;
@@ -19,13 +20,20 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
+pub mod flow_states;
 mod temp_keys;
 
-// Default value for max number of delegation origins to store in the list of latest used delegation origins
-const MAX_NUM_DELEGATION_ORIGINS: u64 = 1000;
+/// Default captcha config
+pub const DEFAULT_CAPTCHA_CONFIG: CaptchaConfig = CaptchaConfig {
+    max_unsolved_captchas: 500,
+    captcha_trigger: CaptchaTrigger::Static(StaticCaptchaTrigger::CaptchaEnabled),
+};
 
-// Default value for max number of inflight captchas.
-pub const MAX_INFLIGHT_CAPTCHAS: u64 = 500;
+/// Default registration rate limit config.
+pub const DEFAULT_RATE_LIMIT_CONFIG: RateLimitConfig = RateLimitConfig {
+    time_per_token_ns: Duration::from_secs(10).as_nanos() as u64,
+    max_tokens: 20_000,
+};
 
 thread_local! {
     static STATE: State = State::default();
@@ -53,6 +61,8 @@ pub struct UsageMetrics {
     pub delegation_counter: u64,
     // number of anchor operations (register, add, remove, update) since last upgrade
     pub anchor_operation_counter: u64,
+    // number of prepare_id_alias calls since last upgrade
+    pub prepare_id_alias_counter: u64,
 }
 
 // The challenges we store and check against
@@ -84,35 +94,54 @@ pub struct PersistentState {
     // Amount of cycles that need to be attached when II creates a canister
     pub canister_creation_cycles_cost: u64,
     // Configuration for the rate limit on `register`, if any.
-    pub registration_rate_limit: Option<RateLimitConfig>,
+    pub registration_rate_limit: RateLimitConfig,
     // Daily and monthly active anchor statistics
-    pub active_anchor_stats: Option<ActivityStats<ActiveAnchorCounter>>,
+    pub active_anchor_stats: ActivityStats<ActiveAnchorCounter>,
     // Daily and monthly active anchor statistics (filtered by domain)
-    pub domain_active_anchor_stats: Option<ActivityStats<DomainActiveAnchorCounter>>,
+    pub domain_active_anchor_stats: ActivityStats<DomainActiveAnchorCounter>,
     // Daily and monthly active authentication methods on the II domains.
-    pub active_authn_method_stats: Option<ActivityStats<AuthnMethodCounter>>,
-    // Hashmap of last used delegation origins
-    pub latest_delegation_origins: Option<HashMap<FrontendHostname, Timestamp>>,
-    // Maximum number of latest delegation origins to store
-    pub max_num_latest_delegation_origins: Option<u64>,
-    // Maximum number of inflight captchas
-    pub max_inflight_captchas: Option<u64>,
+    pub active_authn_method_stats: ActivityStats<AuthnMethodCounter>,
+    // Configuration of the captcha challenge during registration flow
+    pub captcha_config: CaptchaConfig,
+    // Configuration for Related Origins Requests
+    pub related_origins: Option<Vec<String>>,
+    // Configuration for OpenID Google client
+    pub openid_google: Option<OpenIdConfig>,
+    // Key into the event_data BTreeMap where the 24h tracking window starts.
+    // This key is used to remove old entries from the 24h event aggregations.
+    // If it is `none`, then the 24h window starts from the newest entry in the event_data
+    // BTreeMap minus 24h.
+    pub event_stats_24h_start: Option<EventKey>,
 }
 
 impl Default for PersistentState {
     fn default() -> Self {
+        let time = time();
         Self {
             archive_state: ArchiveState::default(),
             canister_creation_cycles_cost: 0,
-            registration_rate_limit: None,
-            active_anchor_stats: None,
-            domain_active_anchor_stats: None,
-            active_authn_method_stats: None,
-            latest_delegation_origins: None,
-            max_num_latest_delegation_origins: Some(MAX_NUM_DELEGATION_ORIGINS),
-            max_inflight_captchas: Some(MAX_INFLIGHT_CAPTCHAS),
+            registration_rate_limit: DEFAULT_RATE_LIMIT_CONFIG,
+            active_anchor_stats: ActivityStats::new(time),
+            domain_active_anchor_stats: ActivityStats::new(time),
+            active_authn_method_stats: ActivityStats::new(time),
+            captcha_config: DEFAULT_CAPTCHA_CONFIG,
+            related_origins: None,
+            openid_google: None,
+            event_stats_24h_start: None,
         }
     }
+}
+
+#[cfg(not(test))]
+fn time() -> Timestamp {
+    ic_cdk::api::time()
+}
+
+/// This is required because [ic_cdk::api::time()] traps when executed in a non-canister environment.
+#[cfg(test)]
+fn time() -> Timestamp {
+    // Return a fixed time for testing
+    1709647706487990000 // Tue Mar 05 2024 14:08:26 GMT+0000
 }
 
 #[derive(Clone, Debug, CandidType, Deserialize)]
@@ -125,16 +154,20 @@ pub struct RateLimitState {
     pub token_timestamp: Timestamp,
 }
 
+#[derive(Default)]
 enum StorageState {
+    #[default]
     Uninitialised,
     Initialised(Storage<DefaultMemoryImpl>),
 }
 
+#[derive(Default)]
 struct State {
     storage_state: RefCell<StorageState>,
     sigs: RefCell<SignatureMap>,
     // Temporary keys that can be used in lieu of a particular device
     temp_keys: RefCell<TempKeys>,
+    flow_states: RefCell<FlowStates>,
     last_upgrade_timestamp: Cell<Timestamp>,
     // note: we COULD persist this through upgrades, although this is currently NOT persisted
     // through upgrades
@@ -153,23 +186,8 @@ struct State {
     archive_status_cache: RefCell<Option<ArchiveStatusCache>>,
     // Tracking data for the registration rate limit, if any. Not persisted across upgrades.
     registration_rate_limit: RefCell<Option<RateLimitState>>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            storage_state: RefCell::new(StorageState::Uninitialised),
-            sigs: RefCell::new(SignatureMap::default()),
-            temp_keys: RefCell::new(TempKeys::default()),
-            last_upgrade_timestamp: Cell::new(0),
-            inflight_challenges: RefCell::new(HashMap::new()),
-            tentative_device_registrations: RefCell::new(HashMap::new()),
-            usage_metrics: RefCell::new(UsageMetrics::default()),
-            persistent_state: RefCell::new(PersistentState::default()),
-            archive_status_cache: RefCell::new(None),
-            registration_rate_limit: RefCell::new(None),
-        }
-    }
+    // Counter to ensure uniqueness of event data in case multiple events have the same timestamp
+    event_data_uniqueness_counter: Cell<u16>,
 }
 
 // Checks if salt is empty and calls `init_salt` to set it.
@@ -212,7 +230,7 @@ pub fn init_new() {
     let storage = Storage::new(
         (
             FIRST_ANCHOR_NUMBER,
-            FIRST_ANCHOR_NUMBER.saturating_add(DEFAULT_RANGE_SIZE),
+            FIRST_ANCHOR_NUMBER.saturating_add(MAX_ENTRIES),
         ),
         memory,
     );
@@ -223,15 +241,8 @@ pub fn init_from_stable_memory() {
     STATE.with(|s| {
         s.last_upgrade_timestamp.set(time());
     });
-    let maybe_new_storage = Storage::from_memory(DefaultMemoryImpl::default());
-    match maybe_new_storage {
-        Some(new_storage) => {
-            storage_replace(new_storage);
-        }
-        None => {
-            storage_borrow_mut(|storage| storage.flush());
-        }
-    }
+    let storage = Storage::from_memory(DefaultMemoryImpl::default());
+    storage_replace(storage);
 }
 
 pub fn save_persistent_state() {
@@ -242,19 +253,8 @@ pub fn save_persistent_state() {
 
 pub fn load_persistent_state() {
     STATE.with(|s| {
-        storage_borrow(|storage| match storage.read_persistent_state() {
-            Ok(loaded_state) => *s.persistent_state.borrow_mut() = loaded_state,
-            Err(err) => trap(&format!("failed to recover persistent state! Err: {err:?}")),
-        })
-    });
-
-    // Initialize a sensible default for max_latest_delegation_origins
-    // if it is not set in the persistent state.
-    // This will allow us to later drop the opt and make the field u64.
-    persistent_state_mut(|persistent_state| {
-        persistent_state
-            .max_num_latest_delegation_origins
-            .get_or_insert(MAX_NUM_DELEGATION_ORIGINS);
+        *s.persistent_state.borrow_mut() =
+            storage_borrow(|storage| storage.read_persistent_state());
     });
 }
 
@@ -340,6 +340,14 @@ pub fn with_temp_keys<R>(f: impl FnOnce(&TempKeys) -> R) -> R {
     STATE.with(|s| f(&mut s.temp_keys.borrow()))
 }
 
+pub fn with_flow_states_mut<R>(f: impl FnOnce(&mut FlowStates) -> R) -> R {
+    STATE.with(|s| f(&mut s.flow_states.borrow_mut()))
+}
+
+pub fn with_flow_states<R>(f: impl FnOnce(&FlowStates) -> R) -> R {
+    STATE.with(|s| f(&mut s.flow_states.borrow()))
+}
+
 pub fn usage_metrics<R>(f: impl FnOnce(&UsageMetrics) -> R) -> R {
     STATE.with(|s| f(&s.usage_metrics.borrow()))
 }
@@ -400,5 +408,13 @@ pub fn cache_archive_status(archive_status: ArchiveStatusCache) {
 pub fn invalidate_archive_status_cache() {
     STATE.with(|state| {
         *state.archive_status_cache.borrow_mut() = None;
+    })
+}
+
+pub fn get_and_inc_event_data_counter() -> u16 {
+    STATE.with(|s| {
+        let counter = s.event_data_uniqueness_counter.get();
+        s.event_data_uniqueness_counter.set(counter.wrapping_add(1));
+        counter
     })
 }

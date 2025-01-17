@@ -1,132 +1,116 @@
+use crate::v2_api::authn_method_test_helpers::{
+    create_identity_with_authn_method, sample_webauthn_authn_method, test_authn_method,
+};
+use candid::Principal;
 use canister_tests::api::archive as archive_api;
 use canister_tests::api::internet_identity as ii_api;
+use canister_tests::api::internet_identity::api_v2;
 use canister_tests::flows;
 use canister_tests::framework::*;
-use ic_test_state_machine_client::CallError;
-use ic_test_state_machine_client::ErrorCode::CanisterCalledTrap;
+use ic_cdk::api::management_canister::main::CanisterId;
 use internet_identity_interface::archive::types::*;
 use internet_identity_interface::internet_identity::types::*;
+use pocket_ic::ErrorCode::CanisterCalledTrap;
+use pocket_ic::{CallError, PocketIc};
 use regex::Regex;
 use serde_bytes::ByteBuf;
 use std::collections::HashMap;
 use std::time::Duration;
-use std::time::SystemTime;
+
+fn setup_ii(env: &PocketIc, arg: Option<InternetIdentityInit>) -> CanisterId {
+    let ii_canister = install_ii_canister_with_arg(env, II_WASM.clone(), arg);
+    assert_eq!(
+        ii_api::stats(env, ii_canister)
+            .unwrap()
+            .storage_layout_version,
+        9
+    );
+    ii_canister
+}
 
 /// Tests related to archive deployment (using II).
 #[cfg(test)]
 mod deployment_tests {
     use super::*;
 
-    /// Test to verify that II can spawn an archive canister.
     #[test]
-    fn should_deploy_archive() -> Result<(), CallError> {
+    fn should_deploy_archive() {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
 
-        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)?;
+        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)
+            .expect("archive deployment failed");
+
         assert!(matches!(result, DeployArchiveResult::Success(_)));
-        Ok(())
     }
 
-    /// Test to verify that II can spawn an archive canister when cycles are required.
     #[test]
-    fn should_deploy_archive_with_cycles() -> Result<(), CallError> {
+    fn should_deploy_archive_with_cycles() {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            Some(InternetIdentityInit {
-                archive_config: Some(ArchiveConfig {
-                    module_hash: archive_wasm_hash(&ARCHIVE_WASM),
-                    entries_buffer_limit: 0,
-                    polling_interval_ns: 0,
-                    entries_fetch_limit: 0,
-                }),
-                canister_creation_cycles_cost: Some(100_000_000_000), // current cost in application subnets
-                ..InternetIdentityInit::default()
+        let arg = Some(InternetIdentityInit {
+            archive_config: Some(ArchiveConfig {
+                module_hash: archive_wasm_hash(&ARCHIVE_WASM),
+                entries_buffer_limit: 0,
+                polling_interval_ns: 0,
+                entries_fetch_limit: 0,
             }),
-        );
+            canister_creation_cycles_cost: Some(100_000_000_000), // current cost in application subnets
+            ..InternetIdentityInit::default()
+        });
+        let ii_canister = setup_ii(&env, arg);
         env.add_cycles(ii_canister, 150_000_000_000);
 
-        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)?;
+        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)
+            .expect("archive deployment failed");
+
         assert!(matches!(result, DeployArchiveResult::Success(_)));
         assert_eq!(env.cycle_balance(ii_canister), 50_000_000_000);
-        Ok(())
     }
 
-    /// Test to verify that II will not deploy wasm modules that have the wrong hash.
     #[test]
-    fn should_not_deploy_wrong_wasm() -> Result<(), CallError> {
+    fn should_not_deploy_wrong_wasm() {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
 
-        let result = ii_api::deploy_archive(&env, ii_canister, &EMPTY_WASM)?;
-        match result {
-            DeployArchiveResult::Failed(msg) => {
-                assert_eq!(msg, "invalid wasm module".to_string())
-            }
-            unexpected => panic!("unexpected result: {unexpected:?}"),
-        }
+        let result = ii_api::deploy_archive(&env, ii_canister, &EMPTY_WASM)
+            .expect("archive deployment API call failed");
 
-        let stats = ii_api::stats(&env, ii_canister)?;
+        assert!(matches!(result, DeployArchiveResult::Failed(_)));
+        let stats = ii_api::stats(&env, ii_canister).expect("failed to get stats");
         assert!(stats.archive_info.archive_canister.is_none());
-        Ok(())
     }
 
-    /// Test to verify that II will not spawn the archive canister if no hash is configured.
     #[test]
-    fn should_not_deploy_archive_when_disabled() -> Result<(), CallError> {
+    fn should_not_deploy_archive_when_disabled() {
         let env = env();
-        let ii_canister = install_ii_canister(&env, II_WASM.clone());
+        let ii_canister = setup_ii(&env, Some(InternetIdentityInit::default()));
 
-        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)?;
-        match result {
-            DeployArchiveResult::Failed(msg) => {
-                assert_eq!(msg, "archive deployment disabled".to_string())
-            }
-            unexpected => panic!("unexpected result: {unexpected:?}"),
-        }
+        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)
+            .expect("archive deployment API call failed");
 
-        let stats = ii_api::stats(&env, ii_canister)?;
+        assert!(matches!(result, DeployArchiveResult::Failed(_)));
+        let stats = ii_api::stats(&env, ii_canister).expect("failed to get stats");
         assert!(stats.archive_info.archive_canister.is_none());
-        Ok(())
     }
 
-    /// Test to verify that II will not lose information about the archive wasm hash on upgrade.
     #[test]
-    fn should_keep_archive_module_hash_across_upgrades() -> Result<(), CallError> {
+    fn should_keep_archive_module_hash_across_upgrades() {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
+
         upgrade_ii_canister(&env, ii_canister, II_WASM.clone());
+        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)
+            .expect("archive deployment failed");
 
-        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)?;
         assert!(matches!(result, DeployArchiveResult::Success(_)));
-        Ok(())
     }
 
-    /// Test to verify that the archive WASM hash can be changed on II upgrade and a the archive can be upgraded.
     #[test]
-    fn should_upgrade_the_archive() -> Result<(), CallError> {
+    fn should_upgrade_the_archive() {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(EMPTY_WASM.clone()),
-        );
-
-        let result = ii_api::deploy_archive(&env, ii_canister, &EMPTY_WASM)?;
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(EMPTY_WASM.clone()));
+        let result = ii_api::deploy_archive(&env, ii_canister, &EMPTY_WASM)
+            .expect("archive deployment failed");
         assert!(matches!(result, DeployArchiveResult::Success(_)));
 
         upgrade_ii_canister_with_arg(
@@ -137,33 +121,29 @@ mod deployment_tests {
         )
         .unwrap();
 
-        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)?;
+        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)
+            .expect("archive deployment failed");
         let DeployArchiveResult::Success(archive_canister) = result else {
             panic!("Unexpected result")
         };
 
         // interact with the archive to make sure it is no longer the empty wasm
-        let entries = archive_api::get_entries(&env, archive_canister, None, None)?;
+        let entries = archive_api::get_entries(&env, archive_canister, None, None)
+            .expect("failed to get entries");
         assert_eq!(entries.entries.len(), 0);
-        Ok(())
     }
 
-    /// Test to verify that II can spawn an archive canister when cycles are required.
     #[test]
-    fn should_upgrade_archive_with_only_config_changed() -> Result<(), CallError> {
+    fn should_upgrade_archive_with_only_config_changed() {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
-        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)?;
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
+        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)
+            .expect("failed to deploy archive");
         let DeployArchiveResult::Success(archive_canister) = result else {
             panic!("Unexpected result")
         };
 
-        let status = archive_api::status(&env, archive_canister)?;
+        let status = archive_api::status(&env, archive_canister).expect("failed to get status");
         assert_eq!(status.init.polling_interval_ns, 1_000_000_000);
 
         // change archive config
@@ -182,13 +162,12 @@ mod deployment_tests {
             }),
         )
         .unwrap();
+        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)
+            .expect("failed to deploy archive");
 
-        let result = ii_api::deploy_archive(&env, ii_canister, &ARCHIVE_WASM)?;
         assert!(matches!(result, DeployArchiveResult::Success(_)));
-
-        let status = archive_api::status(&env, archive_canister)?;
+        let status = archive_api::status(&env, archive_canister).expect("failed to get status");
         assert_eq!(status.init.polling_interval_ns, 5_000);
-        Ok(())
     }
 }
 
@@ -197,16 +176,10 @@ mod deployment_tests {
 mod pull_entries_tests {
     use super::*;
 
-    /// Test to verify that the archive pulls the anchor operations from II.
     #[test]
     fn should_record_anchor_operations() -> Result<(), CallError> {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
 
@@ -229,11 +202,7 @@ mod pull_entries_tests {
         )?;
 
         ii_api::remove(&env, ii_canister, principal_1(), anchor, &pubkey)?;
-        let timestamp = env
-            .time()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let timestamp = time(&env);
 
         // the archive polls for entries once per second
         env.advance_time(Duration::from_secs(2));
@@ -241,6 +210,60 @@ mod pull_entries_tests {
         env.tick();
 
         let entries = archive_api::get_entries(&env, archive_canister, None, None)?;
+        assert_expected_entries(timestamp, entries)?;
+        Ok(())
+    }
+
+    #[test]
+    fn should_restore_archive_buffer_from_stable_memory_backup() -> Result<(), CallError> {
+        let env = env();
+        let ii_canister = install_ii_canister(&env, EMPTY_WASM.clone());
+        // re-create the archive canister with II as the controller and the canister id matching the restored backup
+        env.create_canister_with_id(
+            Some(ii_canister),
+            None,
+            Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").unwrap(),
+        )
+        .expect("failed to create archive canister");
+
+        // restore stable memory backup with buffered entries in persistent state
+        restore_compressed_stable_memory(
+            &env,
+            ii_canister,
+            "stable_memory/buffered_archive_entries_v9.bin.gz",
+        );
+        upgrade_ii_canister_with_arg(
+            &env,
+            ii_canister,
+            II_WASM.clone(),
+            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
+        )
+        .expect("II upgrade failed");
+        // the upgrade auto-migrates the storage layout to v9
+        assert_eq!(
+            ii_api::stats(&env, ii_canister)
+                .unwrap()
+                .storage_layout_version,
+            9
+        );
+        // deploy the actual archive wasm
+        let archive_canister = deploy_archive_via_ii(&env, ii_canister);
+        let timestamp = time(&env);
+
+        // have the archive fetch the (restored) buffered entries
+        env.advance_time(Duration::from_secs(2));
+        // execute the timer
+        env.tick();
+        // progress after the inter-canister call
+        env.tick();
+
+        let entries = archive_api::get_entries(&env, archive_canister, None, None)?;
+        assert_expected_entries(timestamp, entries)
+    }
+
+    fn assert_expected_entries(timestamp: u64, entries: Entries) -> Result<(), CallError> {
+        let anchor = 10_000;
+        let pubkey = device_data_2().pubkey.clone();
         assert_eq!(entries.entries.len(), 5);
 
         let register_entry = Entry {
@@ -260,9 +283,9 @@ mod pull_entries_tests {
             caller: principal_1(),
             sequence_number: 0,
         };
-        assert_eq!(
+        assert_eq_with_lenient_timestamp(
             entries.entries.first().unwrap().as_ref().unwrap(),
-            &register_entry
+            &register_entry,
         );
 
         let add_entry = Entry {
@@ -274,9 +297,9 @@ mod pull_entries_tests {
             caller: principal_1(),
             sequence_number: 1,
         };
-        assert_eq!(
+        assert_eq_with_lenient_timestamp(
             entries.entries.get(1).unwrap().as_ref().unwrap(),
-            &add_entry
+            &add_entry,
         );
 
         let update_entry = Entry {
@@ -297,9 +320,9 @@ mod pull_entries_tests {
             caller: principal_1(),
             sequence_number: 2,
         };
-        assert_eq!(
+        assert_eq_with_lenient_timestamp(
             entries.entries.get(2).unwrap().as_ref().unwrap(),
-            &update_entry
+            &update_entry,
         );
 
         let replace_entry = Entry {
@@ -312,9 +335,9 @@ mod pull_entries_tests {
             caller: principal_1(),
             sequence_number: 3,
         };
-        assert_eq!(
+        assert_eq_with_lenient_timestamp(
             entries.entries.get(3).unwrap().as_ref().unwrap(),
-            &replace_entry
+            &replace_entry,
         );
 
         let delete_entry = Entry {
@@ -324,28 +347,38 @@ mod pull_entries_tests {
             caller: principal_1(),
             sequence_number: 4,
         };
-        assert_eq!(
+        assert_eq_with_lenient_timestamp(
             entries.entries.get(4).unwrap().as_ref().unwrap(),
-            &delete_entry
+            &delete_entry,
         );
         Ok(())
     }
 
-    /// Test to verify that the archive pulls device metadata keys for new devices from II.
+    /// Check that the archived entry is as expected with up to 1 second leniency in the timestamp.
+    /// The state machine increases the time every execution round, so the timestamp of the entry
+    /// is brittle to predict exactly.
+    /// For the functionality to be considered correct, the timestamp should be close to the expected
+    /// timestamp, but not to nanosecond precision.
+    fn assert_eq_with_lenient_timestamp(actual: &Entry, expected: &Entry) {
+        assert_eq!(actual.operation, expected.operation);
+        assert_eq!(actual.anchor, expected.anchor);
+        assert_eq!(actual.caller, expected.caller);
+        assert_eq!(actual.sequence_number, expected.sequence_number);
+        assert!(
+            actual.timestamp.abs_diff(expected.timestamp)
+                < Duration::from_secs(1).as_nanos() as u64,
+            "Timestamp difference is bigger than 1 second! actual: {}, expected: {}",
+            actual.timestamp,
+            expected.timestamp
+        );
+    }
+
     #[test]
     fn should_record_metadata_for_new_device() -> Result<(), CallError> {
-        const METADATA_KEY: &str = "key";
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-        let timestamp = env
-            .time()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
+        const METADATA_KEY: &str = "key";
+        let timestamp = time(&env);
 
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
@@ -374,29 +407,19 @@ mod pull_entries_tests {
             caller: device.principal(),
             sequence_number: 0,
         };
-        assert_eq!(
+        assert_eq_with_lenient_timestamp(
             entries.entries.first().unwrap().as_ref().unwrap(),
-            &expected_register_entry
+            &expected_register_entry,
         );
-
         Ok(())
     }
 
-    /// Test to verify that the archive pulls device metadata changes from II.
     #[test]
     fn should_record_metadata_change() -> Result<(), CallError> {
-        const METADATA_KEY: &str = "key";
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-        let timestamp = env
-            .time()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
+        const METADATA_KEY: &str = "key";
+        let timestamp = time(&env);
 
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
@@ -444,29 +467,19 @@ mod pull_entries_tests {
             caller: device.principal(),
             sequence_number: 1,
         };
-        assert_eq!(
+        assert_eq_with_lenient_timestamp(
             entries.entries.get(1).unwrap().as_ref().unwrap(),
-            &expected_update_entry
+            &expected_update_entry,
         );
-
         Ok(())
     }
 
-    /// Test to verify that the archive pulls identity metadata replace operations from II.
     #[test]
     fn should_record_identity_metadata_replace() -> Result<(), CallError> {
-        const METADATA_KEY: &str = "some-metadata-key";
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-        let timestamp = env
-            .time()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
+        const METADATA_KEY: &str = "some-metadata-key";
+        let timestamp = time(&env);
 
         let device = DeviceData::auth_test_device();
         let anchor = flows::register_anchor_with_device(&env, ii_canister, &device);
@@ -505,24 +518,17 @@ mod pull_entries_tests {
             caller: device.principal(),
             sequence_number: 0,
         };
-        assert_eq!(
+        assert_eq_with_lenient_timestamp(
             entries.entries.first().unwrap().as_ref().unwrap(),
-            &expected_metadata_entry
+            &expected_metadata_entry,
         );
-
         Ok(())
     }
 
-    /// Test to verify that the archive pulls the anchor operations from II periodically.
     #[test]
     fn should_fetch_multiple_times() -> Result<(), CallError> {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
         flows::register_anchor(&env, ii_canister);
@@ -549,16 +555,10 @@ mod pull_entries_tests {
         Ok(())
     }
 
-    /// Tests integration if II has no new messages to archive.
     #[test]
     fn should_succeed_on_empty_fetch_result() -> Result<(), CallError> {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
 
@@ -569,30 +569,21 @@ mod pull_entries_tests {
 
         let status = archive_api::status(&env, archive_canister)?;
         assert!(status.call_info.call_errors.is_empty());
-        assert_eq!(
-            status.call_info.last_successful_fetch,
-            Some(FetchInfo {
-                timestamp: env
-                    .time()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64,
-                number_of_entries: 0,
-            })
+        let fetch_info = status
+            .call_info
+            .last_successful_fetch
+            .expect("no fetch info");
+        assert_eq!(fetch_info.number_of_entries, 0);
+        assert!(
+            fetch_info.timestamp.abs_diff(time(&env)) < Duration::from_secs(1).as_nanos() as u64
         );
         Ok(())
     }
 
-    /// Tests that the archive fetch info entries count is accurate.
     #[test]
     fn should_report_correct_number_of_fetched_entries() -> Result<(), CallError> {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
 
@@ -604,28 +595,24 @@ mod pull_entries_tests {
         env.advance_time(Duration::from_secs(2));
         // execute the timer
         env.tick();
+        // resume after inter-canister call
+        env.tick();
 
         let status = archive_api::status(&env, archive_canister)?;
         assert!(status.call_info.call_errors.is_empty());
-        assert_eq!(
-            status.call_info.last_successful_fetch,
-            Some(FetchInfo {
-                timestamp: env
-                    .time()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64,
-                number_of_entries: 3,
-            })
+        let fetch_info = status
+            .call_info
+            .last_successful_fetch
+            .expect("no fetch info");
+        assert_eq!(fetch_info.number_of_entries, 3);
+        assert!(
+            fetch_info.timestamp.abs_diff(time(&env)) < Duration::from_secs(1).as_nanos() as u64
         );
 
         assert_metric(
             &get_metrics(&env, archive_canister),
             "ii_archive_last_successful_fetch_timestamp_seconds",
-            env.time()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
+            Duration::from_nanos(time(&env)).as_secs() as f64,
         );
         assert_metric(
             &get_metrics(&env, archive_canister),
@@ -640,11 +627,10 @@ mod pull_entries_tests {
         Ok(())
     }
 
-    /// Tests that II exposes metrics regarding the archive config.
     #[test]
-    fn should_report_archive_config_metrics() -> Result<(), CallError> {
+    fn should_report_archive_config_metrics() {
         let env = env();
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let init_arg = InternetIdentityInit {
             archive_config: Some(ArchiveConfig {
                 module_hash: archive_wasm_hash(&ARCHIVE_WASM),
@@ -652,11 +638,10 @@ mod pull_entries_tests {
                 polling_interval_ns: Duration::from_secs(3).as_nanos() as u64,
                 entries_fetch_limit: 10,
             }),
-            canister_creation_cycles_cost: Some(0),
             ..InternetIdentityInit::default()
         };
-
-        let ii_canister = install_ii_canister_with_arg(&env, II_WASM.clone(), Some(init_arg));
+        upgrade_ii_canister_with_arg(&env, ii_canister, II_WASM.clone(), Some(init_arg))
+            .expect("II upgrade failed");
         deploy_archive_via_ii(&env, ii_canister);
 
         assert_metric(
@@ -674,19 +659,79 @@ mod pull_entries_tests {
             "internet_identity_archive_config_polling_interval_seconds",
             3f64,
         );
-        Ok(())
     }
 
-    /// Tests that the archive reports on fetch errors.
+    #[test]
+    fn should_report_archive_entries_metrics() {
+        let env = env();
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
+        let init_arg = InternetIdentityInit {
+            archive_config: Some(ArchiveConfig {
+                module_hash: archive_wasm_hash(&ARCHIVE_WASM),
+                entries_buffer_limit: 20_000,
+                polling_interval_ns: Duration::from_secs(60).as_nanos() as u64,
+                entries_fetch_limit: 2, // only fetch 2 entries at a time
+            }),
+            ..InternetIdentityInit::default()
+        };
+        upgrade_ii_canister_with_arg(&env, ii_canister, II_WASM.clone(), Some(init_arg))
+            .expect("II upgrade failed");
+        let archive_canister = deploy_archive_via_ii(&env, ii_canister);
+
+        assert_metric(
+            &get_metrics(&env, ii_canister),
+            "internet_identity_archive_sequence_number",
+            0f64,
+        );
+        assert_metric(
+            &get_metrics(&env, ii_canister),
+            "internet_identity_buffered_archive_entries",
+            0f64,
+        );
+
+        // stop the archive so that the entries start piling up in the buffer
+        env.stop_canister(archive_canister, Some(ii_canister))
+            .expect("failed to stop archive");
+
+        for _ in 0..3 {
+            flows::register_anchor(&env, ii_canister);
+        }
+
+        assert_metric(
+            &get_metrics(&env, ii_canister),
+            "internet_identity_archive_sequence_number",
+            3f64,
+        );
+        assert_metric(
+            &get_metrics(&env, ii_canister),
+            "internet_identity_buffered_archive_entries",
+            3f64,
+        );
+
+        // start the archive again so that the entries are fetched from the buffer
+        env.start_canister(archive_canister, Some(ii_canister))
+            .expect("failed to start archive");
+
+        // allow the archive to poll once
+        env.advance_time(Duration::from_secs(60));
+        env.tick();
+
+        assert_metric(
+            &get_metrics(&env, ii_canister),
+            "internet_identity_archive_sequence_number",
+            3f64,
+        );
+        assert_metric(
+            &get_metrics(&env, ii_canister),
+            "internet_identity_buffered_archive_entries",
+            1f64, // one entry should be left in the buffer as the fetch limit is 2
+        );
+    }
+
     #[test]
     fn should_report_call_errors() -> Result<(), CallError> {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
 
@@ -703,34 +748,33 @@ mod pull_entries_tests {
         assert_eq!(status.call_info.last_successful_fetch, None);
 
         let expected_error = CallErrorInfo {
-            time: env
-                .time()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64,
+            time: time(&env),
             canister: ii_canister,
             method: "fetch_entries".to_string(),
             argument: ByteBuf::from(candid::encode_one(()).unwrap()),
             rejection_code: 5,
             message: format!("Canister {} is stopped", ii_canister.to_text()),
         };
-        assert_eq!(
-            status.call_info.call_errors.first().unwrap(),
-            &expected_error
+        let actual_error = status.call_info.call_errors.first().unwrap();
+        assert_eq!(actual_error.canister, expected_error.canister);
+        assert_eq!(actual_error.method, expected_error.method);
+        assert_eq!(actual_error.argument, expected_error.argument);
+        assert_eq!(actual_error.rejection_code, expected_error.rejection_code);
+        assert_eq!(actual_error.message, expected_error.message);
+        assert!(
+            actual_error.time.abs_diff(expected_error.time)
+                < Duration::from_secs(1).as_nanos() as u64,
+            "Timestamp difference is bigger than 1 second! actual: {}, expected: {}",
+            actual_error.time,
+            expected_error.time
         );
         Ok(())
     }
 
-    /// Tests that the archive recovers after fetch errors.
     #[test]
     fn should_recover_after_error() -> Result<(), CallError> {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
 
@@ -758,16 +802,10 @@ mod pull_entries_tests {
         Ok(())
     }
 
-    /// Tests that II provides the entries ordered by sequence number.
     #[test]
     fn should_return_entries_ordered() -> Result<(), CallError> {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
 
@@ -783,16 +821,10 @@ mod pull_entries_tests {
         Ok(())
     }
 
-    /// Tests that only the archive canister can fetch entries.
     #[test]
     fn should_not_allow_wrong_caller_to_fetch_entries() {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
 
@@ -807,16 +839,10 @@ mod pull_entries_tests {
         );
     }
 
-    /// Tests that only the archive canister can acknowledge entries.
     #[test]
     fn should_not_allow_wrong_caller_to_acknowledge_entries() {
         let env = env();
-        let ii_canister = install_ii_canister_with_arg(
-            &env,
-            II_WASM.clone(),
-            arg_with_wasm_hash(ARCHIVE_WASM.clone()),
-        );
-
+        let ii_canister = setup_ii(&env, arg_with_wasm_hash(ARCHIVE_WASM.clone()));
         let archive_canister = deploy_archive_via_ii(&env, ii_canister);
         assert!(env.canister_exists(archive_canister));
 
@@ -828,6 +854,55 @@ mod pull_entries_tests {
                 "only the archive canister [a-z0-9-]+ is allowed to fetch and acknowledge entries",
             )
             .unwrap(),
+        );
+    }
+
+    #[test]
+    fn should_not_accept_changes_if_archive_buffer_full() {
+        let env = env();
+        let ii_canister = install_ii_canister_with_arg(
+            &env,
+            II_WASM.clone(),
+            Some(InternetIdentityInit {
+                archive_config: Some(ArchiveConfig {
+                    module_hash: archive_wasm_hash(&ARCHIVE_WASM),
+                    entries_buffer_limit: 3,
+                    polling_interval_ns: 0,
+                    entries_fetch_limit: 0,
+                }),
+                ..InternetIdentityInit::default()
+            }),
+        );
+        let archive_canister = deploy_archive_via_ii(&env, ii_canister);
+        // stop the archive so that the entries start piling up in the buffer
+        env.stop_canister(archive_canister, Some(ii_canister))
+            .expect("failed to stop archive");
+
+        let authn_method = test_authn_method();
+        let identity = create_identity_with_authn_method(&env, ii_canister, &authn_method);
+        for i in 0..2 {
+            api_v2::authn_method_add(
+                &env,
+                ii_canister,
+                authn_method.principal(),
+                identity,
+                &sample_webauthn_authn_method(i + 1),
+            )
+            .expect("API call failed")
+            .expect("authn_method_add failed");
+        }
+
+        let result = api_v2::authn_method_add(
+            &env,
+            ii_canister,
+            authn_method.principal(),
+            identity,
+            &sample_webauthn_authn_method(3),
+        );
+        expect_user_error_with_message(
+            result,
+            CanisterCalledTrap,
+            Regex::new("cannot archive operation, archive entries buffer limit reached").unwrap(),
         );
     }
 }

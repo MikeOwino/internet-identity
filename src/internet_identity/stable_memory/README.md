@@ -5,13 +5,24 @@ These tests serve two purposes:
 * Show that we can indeed fully recover in case of a disaster, assuming
   we have a backup of the stable memory.
 
+## Stable Memory Backups
+
+The following stable memory backups are currently used:
+* `buffered_archive_entries_v9.bin.gz`: a backup with buffered archive entries.
+* `genesis-layout-migrated-to-v9.bin.gz`: a backup initially created with the first version of the stable memory layout and then incrementally migrated to the v8 layout. It contains a few well-known identities / devices, see `known_devices` in `tests/integration/stable_memory.rs`.
+* `genesis-memory-layout.bin`: a backup of the initial memory layout. Not migrated. Mainly used to test behavior with respect to outdated / unsupported memory layouts.
+* `multiple-recovery-phrases-v9.bin.gz`: a backup with an identity that has multiple recovery phrases. The input validation does no longer allow to create such an identity (only one recovery phrase is allowed). However, legacy users that are in that state need a way to make their identity consistent again. This backup is used to test exactly that.
+* `persistent_state_archive_v9.bin.gz`: a backup to check that archive state and configuration are restored correctly.
+* `persistent_state_no_archive_v9.bin.gz`: a backup to check that persistent state without an archive is restored correctly. 
+* `stats_incident_v9.bin.gz`: a back-up of a state that caused the incident on May 23rd, 2024. It is used to make sure that newer versions of II can correctly recover from this state.
+
 ## Creating New Test Memory Backups
 
 ### Using Canister Test Infrastructure
 These backup memory files are generated using the `canister_tests` infrastructure. To create a new backup file:
-1. Install II on the `StateMachine`
+1. Install II on the `PocketIc`
     ```rust
-    let env = StateMachine::new();
+    let env = PocketIc::new();
     let canister_id = install_ii_canister(&env, framework::II_WASM.clone());
     ```
 2. Create the desired state in II by interacting with it.

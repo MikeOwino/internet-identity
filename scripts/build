@@ -18,13 +18,12 @@ function usage() {
     cat << EOF
 
 Usage:
-  $0 [--only-dependencies] [--internet-identity] [--archive] [--dfx-metadata METADATA]
+  $0 [--only-dependencies] [--internet-identity] [--archive]
 
 Options:
   --only-dependencies          only build rust dependencies (no js build, no wasm optimization)
   --internet-identity          build the internet_identity canister (alongside other specifically mentioned canisters), defaults to --internet-identity
   --archive                    build the archive canister (alongside other specifically mentioned canisters), defaults to --internet-identity
-  --dfx-metadata METADATA      DFX metadata to include in the canister public metadata section
 EOF
 }
 
@@ -40,7 +39,6 @@ EOF
 
 ONLY_DEPS=
 CANISTERS=()
-DFX_METADATA=
 
 while [[ $# -gt 0  ]]
 do
@@ -63,11 +61,6 @@ do
             CANISTERS+=("archive")
             shift
             ;;
-        --dfx-metadata)
-            DFX_METADATA="${2:?missing value for '--dfx-metadata'}"
-            shift; # shift past --dfx-metadata and value
-            shift;
-            ;;
         *)
             echo "ERROR: unknown argument $1"
             usage
@@ -87,11 +80,11 @@ if [ ${#CANISTERS[@]} -eq 0 ]; then
 fi
 
 # Checking for dependencies
-if [[ ! "$(command -v ic-wasm)" || "$(ic-wasm --version)" != "ic-wasm 0.3.5" ]]
+if [[ ! "$(command -v ic-wasm)" || "$(ic-wasm --version)" != "ic-wasm 0.8.5" ]]
 then
-    echo "could not find ic-wasm 0.3.5"
-    echo "ic-wasm version 0.3.5 is needed, please run the following command:"
-    echo "  cargo install ic-wasm --version 0.3.5"
+    echo "could not find ic-wasm 0.8.5"
+    echo "ic-wasm version 0.8.5 is needed, please run the following command:"
+    echo "  cargo install ic-wasm --version 0.8.5"
     exit 1
 fi
 
@@ -127,7 +120,7 @@ function build_canister() {
     TARGET="wasm32-unknown-unknown"
     # standardize source references
     CARGO_HOME="${CARGO_HOME:-"$HOME/.cargo"}"
-    RUSTFLAGS="--remap-path-prefix $CARGO_HOME=/cargo"
+    RUSTFLAGS="--remap-path-prefix $CARGO_HOME=/cargo -C link-args=-zstack-size=3000000"
 
     cargo_build_args=(
         --manifest-path "$SRC_DIR/Cargo.toml"
@@ -160,11 +153,33 @@ function build_canister() {
         then
           # indicate the II canister init argument type
           ic-wasm "$canister.wasm" -o "$canister.wasm" metadata candid:args -d "(opt InternetIdentityInit)" -v public
-        fi
 
-        if [ -n "$DFX_METADATA" ]
-        then
-          ic-wasm "$canister.wasm" -o "$canister.wasm" metadata dfx -d "$DFX_METADATA" -v public
+
+          # Write metadata for dfx.
+          # The metadata includes a link to the release, which only exists if this is a release build.
+          # In case of a release build, the version looks like this: <commit>,<release>,<dirty>
+          # We include the URL of a checksum file so that dfx clients can check the hash
+          # of the build (for caching & integrity checking)
+          IFS=,
+          read -r -a version_parts <<< "$II_VERSION"
+          release="${version_parts[1]}"
+          if [ -n "$release" ]
+          then
+              asset_name="internet_identity_dev.wasm.gz"
+              wasm_url="https://github.com/dfinity/internet-identity/releases/download/$release/$asset_name"
+              wasm_hash_url="https://github.com/dfinity/internet-identity/releases/download/$release/$asset_name.sha256"
+              # init_arg that disables the captcha, appropriate for the dev build
+              init_arg="(opt record { captcha_config = opt record { max_unsolved_captchas= 50:nat64; captcha_trigger = variant {Static = variant {CaptchaDisabled}}}})"
+              init_guide="Use '(null)' for sensible defaults. See the candid interface for more details."
+              metadata_json=$(echo '{}' | jq -cMr \
+                  --arg wasm_url "$wasm_url" \
+                  --arg wasm_hash_url "$wasm_hash_url" \
+                  --arg init_arg "$init_arg" \
+                  --arg init_guide "$init_guide" \
+                  '. | .pullable = { wasm_url: $wasm_url, wasm_hash_url: $wasm_hash_url, dependencies: [], init_arg: $init_arg, init_guide: $init_guide} ')
+              ic-wasm "$canister.wasm" -o "$canister.wasm" metadata dfx -d "$metadata_json" -v public
+          fi
+
         fi
         gzip --no-name --force "$canister.wasm"
     fi
@@ -187,13 +202,12 @@ function build_internet_identity() {
       echo "USING DUMMY CAPTCHA"
       extra_build_args+=( --features dummy_captcha )
   fi
-  # This enables the "insecure_requests" feature which disables the content security policy directive
-  # 'upgrade-insecure-requests'.
+  # This enables the "dev_csp" feature which weakens the content security policy to facilitate development.
   # WARNING: this MUST be opt-in, because we DO NOT want this in production.
-  if [ "${II_INSECURE_REQUESTS:-}" == "1" ]
+  if [ "${II_DEV_CSP:-}" == "1" ]
   then
-      echo "ALLOWING INSECURE REQUESTS"
-      extra_build_args+=( --features insecure_requests )
+      echo "USING DEV CONTENT SECURITY POLICY"
+      extra_build_args+=( --features dev_csp )
   fi
   # XXX: for bash > 4.4, empty arrays are considered unset, so do some substitution
   build_canister "internet_identity" ${extra_build_args[@]+"${extra_build_args[@]}"}

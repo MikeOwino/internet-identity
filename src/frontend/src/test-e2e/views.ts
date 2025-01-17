@@ -1,6 +1,7 @@
 import { zip } from "$src/utils/utils";
 import { Principal } from "@dfinity/principal";
 import { nonNullish } from "@dfinity/utils";
+import { assert } from "vitest";
 import { waitToClose } from "./util";
 
 class View {
@@ -24,7 +25,7 @@ export class WelcomeView extends View {
     await this.browser.$("#loginButton").scrollIntoView();
     await this.browser.$("#loginButton").click();
     await this.typeUserNumber(userNumber);
-    await this.browser.$('[data-action="continue"').click();
+    await this.browser.$('[data-action="continue"]').click();
   }
 
   async register(): Promise<void> {
@@ -58,16 +59,16 @@ export class RenameView extends View {
 export class RegisterView extends View {
   async waitForDisplay(): Promise<void> {
     await this.browser
-      .$('[data-action="construct-identity"')
+      .$('[data-action="construct-identity"]')
       .waitForDisplayed({ timeout: 10_000 });
   }
 
   async create(): Promise<void> {
-    await this.browser.$('[data-action="construct-identity"').click();
+    await this.browser.$('[data-action="construct-identity"]').click();
   }
 
   async createPin(): Promise<void> {
-    await this.browser.$('[data-action="construct-pin-identity"').click();
+    await this.browser.$('[data-action="construct-pin-identity"]').click();
   }
 
   // View: Register confirmation
@@ -107,7 +108,7 @@ export class RegisterView extends View {
 
   async assertPinRegistrationNotShown(): Promise<void> {
     await this.browser
-      .$('[data-action="construct-pin-identity"')
+      .$('[data-action="construct-pin-identity"]')
       .waitForDisplayed({ reverse: true });
   }
 }
@@ -120,7 +121,7 @@ export class PinRegistrationView extends View {
   }
 
   async pinInfoContinue(): Promise<void> {
-    await this.browser.$('[data-action="continue-pin"').click();
+    await this.browser.$('[data-action="continue-pin"]').click();
   }
   async waitForSetPin(): Promise<void> {
     await this.browser
@@ -130,7 +131,7 @@ export class PinRegistrationView extends View {
 
   async setPin(pin: string): Promise<void> {
     const inputs = await this.browser.$('[data-role="set-pin"]').$$("input");
-    for (const [input, digit] of zip(inputs, pin.split(""))) {
+    for (const [input, digit] of zip(Array.from(inputs), pin.split(""))) {
       await input.setValue(digit);
     }
   }
@@ -144,7 +145,7 @@ export class PinRegistrationView extends View {
     const inputs = await this.browser
       .$('[data-role="confirm-pin"]')
       .$$("input");
-    for (const [input, digit] of zip(inputs, pin.split(""))) {
+    for (const [input, digit] of zip(Array.from(inputs), pin.split(""))) {
       await input.setValue(digit);
     }
   }
@@ -160,7 +161,7 @@ export class PinAuthView extends View {
 
   async enterPin(pin: string): Promise<void> {
     const inputs = await this.browser.$('[data-role="pin"]').$$("input");
-    for (const [input, digit] of zip(inputs, pin.split(""))) {
+    for (const [input, digit] of zip(Array.from(inputs), pin.split(""))) {
       await input.setValue(digit);
     }
   }
@@ -462,13 +463,25 @@ export class VerifyRemoteDeviceView extends View {
     const inputs = await this.browser
       .$('[data-role="verification-code"]')
       .$$("input");
-    for (const [input, digit] of zip(inputs, code.split(""))) {
+    for (const [input, digit] of zip(Array.from(inputs), code.split(""))) {
       await input.setValue(digit);
     }
   }
 
   async continue(): Promise<void> {
     await this.browser.$("#verifyDevice").click();
+  }
+}
+
+export class PromptDeviceTrustedView extends View {
+  private readonly SELECTOR = "#trustDeviceConfirm";
+
+  async waitForDisplay(): Promise<void> {
+    await this.browser.$(this.SELECTOR).waitForDisplayed({ timeout: 5_000 });
+  }
+
+  async confirmTrusted(): Promise<void> {
+    await this.browser.$(this.SELECTOR).click();
   }
 }
 
@@ -495,6 +508,10 @@ export class AuthenticateView extends View {
     await this.browser.$(`[data-anchor-id="${anchor}"]`).click();
   }
 
+  async expectAnchor(anchor: string): Promise<void> {
+    await this.browser.$(`[data-anchor-id="${anchor}"]`).waitForDisplayed();
+  }
+
   async expectAnchorInputField(): Promise<void> {
     await this.browser
       .$('[data-role="anchor-input"]')
@@ -510,6 +527,10 @@ export class AuthenticateView extends View {
   }
 
   async register(): Promise<void> {
+    const moreOptions = await this.browser.$('[data-role="more-options"]');
+    if (await moreOptions.isExisting()) {
+      await moreOptions.click();
+    }
     await this.browser.$("#registerButton").click();
   }
 
@@ -599,13 +620,16 @@ export class VcAllowView extends View {
     await this.browser.$('[data-action="allow"]').click();
   }
 
-  async getUserNumber(): Promise<string> {
-    return await this.browser.$('[data-role="anchor-input"]').getValue();
+  async hasUserNumberInput(): Promise<boolean> {
+    return await this.browser.$('[data-role="anchor-input"]').isExisting();
   }
 
-  async typeUserNumber(userNumber: string): Promise<void> {
-    await this.browser.$('[data-role="anchor-input"]').waitForDisplayed();
-    await this.browser.$('[data-role="anchor-input"]').setValue(userNumber);
+  async getRelyingParty(): Promise<string> {
+    return await this.browser.$('[data-role="relying-party"]').getText();
+  }
+
+  async getIssuer(): Promise<string> {
+    return await this.browser.$('[data-role="issuer"]').getText();
   }
 }
 
@@ -621,6 +645,26 @@ export class IssuerAppView extends View {
     const iiUrlInput = await this.browser.$('[data-role="ii-url"]');
     await iiUrlInput.clearValue();
     await iiUrlInput.setValue(iiUrl);
+  }
+
+  async setPrincipal({ principal }: { principal: string }): Promise<void> {
+    const principalInput = await this.browser.$(
+      '[data-role="custom-principal"]'
+    );
+    await principalInput.clearValue();
+    await principalInput.setValue(principal);
+  }
+
+  async setDerivationOrigin({
+    derivationOrigin,
+  }: {
+    derivationOrigin: string;
+  }): Promise<void> {
+    const derivationOriginInput = await this.browser.$(
+      '[data-role="derivation-origin"]'
+    );
+    await derivationOriginInput.clearValue();
+    await derivationOriginInput.setValue(derivationOrigin);
   }
 
   async waitForDisplay(): Promise<void> {
@@ -698,11 +742,17 @@ export class VcTestAppView extends View {
   async open(
     demoAppUrl: string,
     iiUrl: string,
-    issuerUrl: string
+    issuerUrl: string,
+    issuerCanisterId: string
   ): Promise<void> {
     await this.browser.url(demoAppUrl);
     await setInputValue(this.browser, '[data-role="ii-url"]', iiUrl);
     await setInputValue(this.browser, '[data-role="issuer-url"]', issuerUrl);
+    await setInputValue(
+      this.browser,
+      '[data-role="issuer-canister-id"]',
+      issuerCanisterId
+    );
   }
 
   async startSignIn(): Promise<void> {
@@ -790,6 +840,19 @@ export class DemoAppView extends View {
     return await this.browser.$("#principal").getText();
   }
 
+  async setAllowPin(allowed: boolean): Promise<void> {
+    const checkbox = await this.browser.$("#allowPinAuthentication");
+    const selected = await checkbox.isSelected();
+
+    if (allowed !== selected) {
+      await checkbox.click();
+    }
+  }
+
+  async getAuthnMethod(): Promise<string> {
+    return await this.browser.$('[data-role="authn-method"]').getText();
+  }
+
   async signin(): Promise<void> {
     await this.browser.$("#signinBtn").click();
   }
@@ -813,6 +876,10 @@ export class DemoAppView extends View {
 
   async setDerivationOrigin(derivationOrigin: string): Promise<void> {
     await fillText(this.browser, "derivationOrigin", derivationOrigin);
+  }
+
+  async setAutoSelectionPrincipal(principal: string): Promise<void> {
+    await fillText(this.browser, "autoSelectionPrincipal", principal);
   }
 
   async whoami(): Promise<string> {

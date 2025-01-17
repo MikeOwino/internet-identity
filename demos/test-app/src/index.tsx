@@ -56,6 +56,9 @@ const newAlternativeOriginsEl = document.getElementById(
   "newAlternativeOrigins"
 ) as HTMLInputElement;
 const principalEl = document.getElementById("principal") as HTMLDivElement;
+const authnMethodEl = document.querySelector(
+  '[data-role="authn-method"]'
+) as HTMLDivElement;
 const delegationEl = document.getElementById("delegation") as HTMLPreElement;
 const expirationEl = document.getElementById("expiration") as HTMLDivElement;
 const iiUrlEl = document.getElementById("iiUrl") as HTMLInputElement;
@@ -64,6 +67,12 @@ const maxTimeToLiveEl = document.getElementById(
 ) as HTMLInputElement;
 const derivationOriginEl = document.getElementById(
   "derivationOrigin"
+) as HTMLInputElement;
+const autoSelectionPrincipalEl = document.getElementById(
+  "autoSelectionPrincipal"
+) as HTMLInputElement;
+const allowPinAuthenticationEl = document.getElementById(
+  "allowPinAuthentication"
 ) as HTMLInputElement;
 
 let iiProtocolTestWindow: Window | undefined;
@@ -109,8 +118,19 @@ const idlFactory = ({ IDL }: { IDL: any }) => {
   });
 };
 
-const updateDelegationView = (identity: Identity) => {
+const updateDelegationView = ({
+  authnMethod,
+  identity,
+}: {
+  authnMethod?: string;
+  identity: Identity;
+}) => {
   principalEl.innerText = identity.getPrincipal().toText();
+
+  if (authnMethod !== undefined) {
+    authnMethodEl.innerText = authnMethod;
+  }
+
   if (identity instanceof DelegationIdentity) {
     delegationEl.innerText = JSON.stringify(
       identity.getDelegation().toJSON(),
@@ -181,9 +201,12 @@ window.addEventListener("message", (event) => {
     delegations,
     event.data.userPublicKey.buffer
   );
-  updateDelegationView(
-    DelegationIdentity.fromDelegation(getLocalIdentity(), delegationChain)
-  );
+  updateDelegationView({
+    identity: DelegationIdentity.fromDelegation(
+      getLocalIdentity(),
+      delegationChain
+    ),
+  });
 });
 
 const readCanisterId = (): string => {
@@ -202,15 +225,29 @@ const init = async () => {
       maxTimeToLive_ > BigInt(0) ? maxTimeToLive_ : authClientDefaultMaxTTL;
     const derivationOrigin =
       derivationOriginEl.value !== "" ? derivationOriginEl.value : undefined;
+    const autoSelectionPrincipal =
+      autoSelectionPrincipalEl.value !== ""
+        ? autoSelectionPrincipalEl.value
+        : undefined;
+
+    const allowPinAuthentication = allowPinAuthenticationEl.checked
+      ? undefined
+      : false;
 
     try {
-      delegationIdentity = await authWithII({
+      const result = await authWithII({
         url: iiUrlEl.value,
         maxTimeToLive,
         derivationOrigin,
+        allowPinAuthentication,
         sessionIdentity: getLocalIdentity(),
+        autoSelectionPrincipal,
       });
-      updateDelegationView(delegationIdentity);
+      delegationIdentity = result.identity;
+      updateDelegationView({
+        identity: delegationIdentity,
+        authnMethod: result.authnMethod,
+      });
     } catch (e) {
       showError(JSON.stringify(e));
     }
@@ -318,11 +355,13 @@ init();
 
 whoamiBtn.addEventListener("click", async () => {
   const canisterId = Principal.fromText(readCanisterId());
+  const agent = new HttpAgent({
+    host: hostUrlEl.value,
+    identity: delegationIdentity,
+  });
+  await agent.fetchRootKey();
   const actor = Actor.createActor(idlFactory, {
-    agent: new HttpAgent({
-      host: hostUrlEl.value,
-      identity: delegationIdentity,
-    }),
+    agent,
     canisterId,
   });
 
@@ -355,7 +394,7 @@ const credentialSpecs = {
   },
   adult: {
     credentialType: "VerifiedAdult",
-    arguments: { age_at_least: 18 },
+    arguments: { minAge: 18 },
   },
 } as const;
 
@@ -366,6 +405,7 @@ let latestOpts:
   | undefined
   | {
       issuerOrigin: string;
+      issuerCanisterId: string;
       derivationOrigin?: string;
       credTy: CredType;
       flowId: number;
@@ -412,6 +452,7 @@ function handleFlowReady(evnt: MessageEvent) {
     params: {
       issuer: {
         origin: opts.issuerOrigin,
+        canisterId: opts.issuerCanisterId,
       },
       credentialSpec: credentialSpecs[opts.credTy],
       credentialSubject: principal,
@@ -419,7 +460,7 @@ function handleFlowReady(evnt: MessageEvent) {
     },
   };
 
-  // register a handler for the "done" message, kick start the flow and then
+  // register a handler for the "done" message, kickstart the flow and then
   // unregister ourselves
   try {
     window.addEventListener("message", handleFlowFinished);
@@ -466,6 +507,8 @@ const App = () => {
     "http://issuer.localhost:5173"
   );
 
+  const [issuerCanisterId, setIssuerCanisterId] = useState<string>("");
+
   // Alternative origin for the RP, if any
   const [derivationOrigin, setDerivationOrigin] = useState<string>("");
 
@@ -496,7 +539,8 @@ const App = () => {
     latestOpts = {
       flowId,
       credTy,
-      issuerOrigin: issuerUrl,
+      issuerOrigin: new URL(issuerUrl).origin,
+      issuerCanisterId,
       derivationOrigin: derivationOrigin !== "" ? derivationOrigin : undefined,
       win: iiWindow,
     };
@@ -514,6 +558,15 @@ const App = () => {
           type="text"
           value={issuerUrl}
           onChange={(evt) => setIssuerUrl(evt.target.value)}
+        />
+      </label>
+      <label>
+        Issuer canister Id:
+        <input
+          data-role="issuer-canister-id"
+          type="text"
+          value={issuerCanisterId}
+          onChange={(evt) => setIssuerCanisterId(evt.target.value)}
         />
       </label>
       <label>

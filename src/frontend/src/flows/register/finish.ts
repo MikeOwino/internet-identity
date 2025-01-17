@@ -1,9 +1,6 @@
+import identityCardBackground from "$src/assets/identityCardBackground.png";
 import { checkmarkIcon, copyIcon } from "$src/components/icons";
-import {
-  IdentityBackground,
-  identityCard,
-  loadIdentityBackground,
-} from "$src/components/identityCard";
+import { identityCard } from "$src/components/identityCard";
 import { mainWindow } from "$src/components/mainWindow";
 import { toast } from "$src/components/toast";
 import {
@@ -12,6 +9,7 @@ import {
   renderPage,
   withRef,
 } from "$src/utils/lit-html";
+import { PreLoadImage } from "$src/utils/preLoadImage";
 import { OmitParams } from "$src/utils/utils";
 import { TemplateResult, html } from "lit-html";
 import { Ref, createRef, ref } from "lit-html/directives/ref.js";
@@ -20,22 +18,18 @@ export const displayUserNumberTemplate = ({
   onContinue,
   userNumber,
   identityBackground,
-  stepper,
   marketingIntroSlot,
   scrollToTop = false,
 }: {
   onContinue: () => void;
   userNumber: bigint;
-  identityBackground: IdentityBackground;
-  stepper: TemplateResult;
+  identityBackground: PreLoadImage;
   marketingIntroSlot?: TemplateResult;
   /* put the page into view */
   scrollToTop?: boolean;
 }) => {
   const userNumberCopy: Ref<HTMLButtonElement> = createRef();
   const displayUserNumberSlot = html`
-
-  ${stepper}
 <hgroup
 
       ${scrollToTop ? mount(() => window.scrollTo(0, 0)) : undefined}
@@ -88,18 +82,8 @@ export const displayUserNumberTemplate = ({
     <section class="c-marketing-block">
       ${marketingIntroSlot}
       <aside class="l-stack">
-        <h3 class="t-title">This number is your Internet Identity</h3>
-        <p class="t-paragraph">With your Internet Identity and your passkey, you will be able to create and securely connect to Internet Computer dapps</p>
-      </aside>
-
-      <aside class="l-stack">
         <h3 class="t-title">Why is it important to save this number?</h3>
-        <p class="t-paragraph">If you lose this number, you will lose access to all of the accounts that you created with it</p>
-      </aside>
-
-      <aside class="l-stack">
-        <h3 class="t-title">Is this number secret?</h3>
-        <p class="t-paragraph"> No, this number is unique to you but it is not secret</p>
+        <p class="t-paragraph">This number is unique but not secret. If you lose this number, you will lose access to all of the accounts that you created with it</p>
       </aside>
     </section>
 
@@ -119,7 +103,7 @@ export const displayUserNumberWarmup = (): OmitParams<
   typeof displayUserNumber,
   "identityBackground"
 > => {
-  const identityBackground = loadIdentityBackground();
+  const identityBackground = new PreLoadImage(identityCardBackground);
   return async (opts) => {
     await displayUserNumber({ ...opts, identityBackground });
   };
@@ -128,12 +112,10 @@ export const displayUserNumberWarmup = (): OmitParams<
 export const displayUserNumber = ({
   userNumber,
   identityBackground,
-  stepper,
   marketingIntroSlot,
 }: {
   userNumber: bigint;
-  identityBackground: IdentityBackground;
-  stepper: TemplateResult;
+  identityBackground: PreLoadImage;
   marketingIntroSlot?: TemplateResult;
 }): Promise<void> => {
   return new Promise((resolve) =>
@@ -141,7 +123,6 @@ export const displayUserNumber = ({
       onContinue: () => resolve(),
       userNumber,
       identityBackground,
-      stepper,
       marketingIntroSlot,
       scrollToTop: true,
     })

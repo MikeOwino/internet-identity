@@ -5,9 +5,9 @@ use candid::Principal;
 use canister_tests::api::internet_identity as api;
 use canister_tests::flows;
 use canister_tests::framework::*;
-use ic_test_state_machine_client::CallError;
-use ic_test_state_machine_client::ErrorCode::CanisterCalledTrap;
 use internet_identity_interface::internet_identity::types::*;
+use pocket_ic::CallError;
+use pocket_ic::ErrorCode::CanisterCalledTrap;
 use regex::Regex;
 use serde_bytes::ByteBuf;
 
@@ -165,14 +165,20 @@ fn upgrade_and_rollback_keeps_anchor_intact() {
     let user_number = flows::register_anchor(&env, canister_id);
     let mut devices_before = api::get_anchor_info(&env, canister_id, principal_1(), user_number)
         .unwrap()
-        .devices;
+        .devices
+        .into_iter()
+        .map(DeviceData::from)
+        .collect::<Vec<_>>();
     upgrade_ii_canister(&env, canister_id, II_WASM.clone());
     api::health_check(&env, canister_id);
     upgrade_ii_canister(&env, canister_id, II_WASM_PREVIOUS.clone());
     api::health_check(&env, canister_id);
     let mut devices_after = api::get_anchor_info(&env, canister_id, principal_1(), user_number)
         .unwrap()
-        .devices;
+        .devices
+        .into_iter()
+        .map(DeviceData::from)
+        .collect::<Vec<_>>();
 
     devices_before.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
     devices_after.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));

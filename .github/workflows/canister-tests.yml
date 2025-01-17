@@ -8,14 +8,13 @@ on:
   push:
 
 jobs:
-
   #####################
   # The docker builds #
   #####################
 
   # The image shared by all builds, containing pre-built rust deps
   docker-build-base:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -23,10 +22,10 @@ jobs:
       # more information, see
       # https://github.com/docker/build-push-action/issues/539
       - name: Set up docker buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Build base Docker image
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
@@ -36,7 +35,7 @@ jobs:
           target: deps
 
   docker-build-ii:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: docker-build-base
     strategy:
       # NOTE: the 'name' in the matrix should match the asset filename, because it is used in
@@ -45,8 +44,12 @@ jobs:
       # NOTE: if you modify the flavors, update the #flavors table in README.md
       matrix:
         include:
-          # The production build is built later because it has a dependency on the dev build (for dfx deps)
-          # See job: docker-build-internet_identity_production
+          # The production build
+          - name: internet_identity_production.wasm.gz
+            II_FETCH_ROOT_KEY: 0
+            II_DUMMY_CAPTCHA: 0
+            II_DUMMY_AUTH: 0
+            II_DEV_CSP: 0
 
           # No captcha and fetching the root key, used in (our) tests, backend and
           # e2e.
@@ -54,7 +57,7 @@ jobs:
             II_FETCH_ROOT_KEY: 1
             II_DUMMY_CAPTCHA: 1
             II_DUMMY_AUTH: 0
-            II_INSECURE_REQUESTS: 0
+            II_DEV_CSP: 0
 
           # Everything disabled, used by third party developers who only care
           # about the login flow
@@ -62,7 +65,7 @@ jobs:
             II_FETCH_ROOT_KEY: 1
             II_DUMMY_CAPTCHA: 1
             II_DUMMY_AUTH: 1
-            II_INSECURE_REQUESTS: 1
+            II_DEV_CSP: 1
 
     steps:
       - uses: actions/checkout@v4
@@ -74,18 +77,11 @@ jobs:
           echo "Inferred version: '$version'"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: "Create dfx metadata for the dfx deps feature"
-        id: dfx-metadata
-        run: |
-          dfx_metadata_json="$(./scripts/dfx-metadata --asset-name ${{ matrix.name }} )"
-          echo "using dfx metadata $dfx_metadata_json"
-          echo "metadata=$dfx_metadata_json" >> "$GITHUB_OUTPUT"
-
       - name: Set up docker buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Build ${{ matrix.name }}
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
@@ -93,9 +89,8 @@ jobs:
             II_FETCH_ROOT_KEY=${{ matrix.II_FETCH_ROOT_KEY }}
             II_DUMMY_AUTH=${{ matrix.II_DUMMY_AUTH }}
             II_DUMMY_CAPTCHA=${{ matrix.II_DUMMY_CAPTCHA }}
-            II_INSECURE_REQUESTS=${{ matrix.II_INSECURE_REQUESTS }}
+            II_DEV_CSP=${{ matrix.II_DEV_CSP }}
             II_VERSION=${{ steps.version.outputs.version }}
-            DFX_METADATA=${{ steps.dfx-metadata.outputs.metadata }}
           cache-from: type=gha,scope=cached-stage
           # Exports the artefacts from the final stage
           outputs: ./out
@@ -103,7 +98,7 @@ jobs:
 
       - run: mv out/internet_identity.wasm.gz ${{ matrix.name }}
       - run: sha256sum ${{ matrix.name }}
-      - name: 'Upload ${{ matrix.name }}'
+      - name: "Upload ${{ matrix.name }}"
         uses: actions/upload-artifact@v4
         with:
           # name is the name used to display and retrieve the artifact
@@ -112,76 +107,17 @@ jobs:
           # file when downloaded
           path: ${{ matrix.name }}
 
-  # Build the production version of internet identity.
-  # The production build is separately because it has a dependency on the dev build (for dfx deps)
-  #
-  # Note: do not rename this job as it needs to contain the file name of the produced asset (without extension)
-  # in order for the release script action to work correctly.
-  docker-build-internet_identity_production:
-    runs-on: ubuntu-latest
-    needs: docker-build-ii
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Infer version
-        id: version
-        run: |
-          version="$(./scripts/version)"
-          echo "Inferred version: '$version'"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: 'Download dev build II wasm.gz'
-        uses: actions/download-artifact@v4
-        with:
-          name: internet_identity_dev.wasm.gz
-          path: .
-
-      - name: "Create dfx metadata for the dfx deps feature"
-        id: dfx-metadata
-        run: |
-          sha256="$(shasum -a 256 ./internet_identity_dev.wasm.gz | cut -d ' ' -f1)"
-          dfx_metadata_json="$(./scripts/dfx-metadata --asset-name internet_identity_dev.wasm.gz --wasm-hash $sha256)"
-          echo "using dfx metadata $dfx_metadata_json"
-          echo "metadata=$dfx_metadata_json" >> "$GITHUB_OUTPUT"
-
-      - name: Set up docker buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Build internet_identity_production.wasm.gz
-        uses: docker/build-push-action@v3
-        with:
-          context: .
-          file: Dockerfile
-          build-args: |
-            II_VERSION=${{ steps.version.outputs.version }}
-            DFX_METADATA=${{ steps.dfx-metadata.outputs.metadata }}
-          cache-from: type=gha,scope=cached-stage
-          # Exports the artefacts from the final stage
-          outputs: ./out
-          target: scratch_internet_identity
-
-      - run: mv out/internet_identity.wasm.gz internet_identity_production.wasm.gz
-      - run: sha256sum internet_identity_production.wasm.gz
-      - name: 'Upload internet_identity_production.wasm.gz'
-        uses: actions/upload-artifact@v4
-        with:
-          # name is the name used to display and retrieve the artifact
-          name: internet_identity_production.wasm.gz
-          # path is the name used as the file to upload and the name of the
-          # file when downloaded
-          path: internet_identity_production.wasm.gz
-
   docker-build-archive:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: docker-build-base
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up docker buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Build Archive Canister
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
@@ -192,7 +128,7 @@ jobs:
 
       - run: mv out/archive.wasm.gz archive.wasm.gz
       - run: sha256sum archive.wasm.gz
-      - name: 'Upload archive.wasm.gz'
+      - name: "Upload archive.wasm.gz"
         uses: actions/upload-artifact@v4
         with:
           # name is the name used to display and retrieve the artifact
@@ -202,11 +138,11 @@ jobs:
           path: archive.wasm.gz
 
   wasm-size:
-    runs-on: ubuntu-latest
-    needs: docker-build-internet_identity_production
+    runs-on: ubuntu-22.04
+    needs: docker-build-ii
     steps:
       - uses: actions/checkout@v4
-      - name: 'Download wasm'
+      - name: "Download wasm"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_production.wasm.gz
@@ -228,7 +164,7 @@ jobs:
           fi
 
   vc_demo_issuer-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
@@ -246,7 +182,7 @@ jobs:
         run: ./build.sh
       - run: sha256sum vc_demo_issuer.wasm.gz
         working-directory: demos/vc_issuer
-      - name: 'Upload VC issuer'
+      - name: "Upload VC issuer"
         uses: actions/upload-artifact@v4
         with:
           # name is the name used to display and retrieve the artifact
@@ -256,7 +192,7 @@ jobs:
           path: ./demos/vc_issuer/vc_demo_issuer.wasm.gz
 
   test-app-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
@@ -272,7 +208,7 @@ jobs:
       - name: "Build test app canister"
         working-directory: demos/test-app
         run: ./build.sh
-      - name: 'Upload test app'
+      - name: "Upload test app"
         uses: actions/upload-artifact@v4
         with:
           # name is the name used to display and retrieve the artifact
@@ -286,7 +222,7 @@ jobs:
   #####################################
 
   vc-issuer-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: [docker-build-ii, vc_demo_issuer-build]
     steps:
       - uses: actions/checkout@v4
@@ -298,27 +234,22 @@ jobs:
             demos/vc_issuer/target
           key: ${{ runner.os }}-cargo-vc-tests-${{ hashFiles('demos/vc_issuer/Cargo.lock', 'rust-toolchain.toml') }}
       - uses: ./.github/actions/bootstrap
-      - name: 'Download VC issuer wasm'
+      - name: "Download VC issuer wasm"
         uses: actions/download-artifact@v4
         with:
           name: vc_demo_issuer.wasm.gz
           path: demos/vc_issuer
-      - name: 'Download II wasm'
+      - name: "Download II wasm"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_test.wasm.gz
           path: .
       - run: mv internet_identity_test.wasm.gz internet_identity.wasm.gz
-      - name: Download ic-test-state-machine binary
+      - name: Install PocketIC
         run: |
-          uname_sys=$(uname -s | tr '[:upper:]' '[:lower:]')
-          echo "uname_sys: $uname_sys"
-          commit_sha=$(sed <.ic-commit 's/#.*$//' | sed '/^$/d')
-          echo "commit sha: $commit_sha"
-          curl -sLO "https://download.dfinity.systems/ic/$commit_sha/binaries/x86_64-$uname_sys/ic-test-state-machine.gz"
-          gzip -d ic-test-state-machine.gz
-          chmod a+x ic-test-state-machine
-          ./ic-test-state-machine --version
+          curl -sL -o pocket-ic.gz https://github.com/dfinity/pocketic/releases/download/6.0.0/pocket-ic-x86_64-linux.gz
+          gzip -d pocket-ic.gz
+          chmod +x pocket-ic
       - name: "Run VC issuer canister tests"
         working-directory: demos/vc_issuer
         run: |
@@ -338,7 +269,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ ubuntu-latest, macos-latest ]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -393,7 +324,7 @@ jobs:
         run: |
           mv /tmp/test-archive/canister-tests-${{ matrix.os }}.tar.zst .
 
-      - name: 'Upload canister test archive'
+      - name: "Upload canister test archive"
         uses: actions/upload-artifact@v4
         with:
           # name is the name used to display and retrieve the artifact
@@ -407,8 +338,8 @@ jobs:
     needs: [canister-tests-build, cached-build, docker-build-archive]
     strategy:
       matrix:
-        os: [ ubuntu-latest, macos-latest ]
-        partition: ['1/3', '2/3', '3/3']
+        os: [ubuntu-latest, macos-latest]
+        partition: ["1/3", "2/3", "3/3"]
     steps:
       - uses: actions/checkout@v4
 
@@ -417,33 +348,31 @@ jobs:
           set -euo pipefail
           curl -LsSf https://get.nexte.st/latest/${{ matrix.os == 'macos-latest' && 'mac' || 'linux' }}  | tar zxf -
 
-      - name: 'Download nextest test archive'
+      - name: "Download nextest test archive"
         uses: actions/download-artifact@v4
         with:
           name: canister-tests-${{ matrix.os }}.tar.zst
           path: .
-      - name: Download ic-test-state-machine binary
+      - name: Install PocketIC
         run: |
-          uname_sys=$(uname -s | tr '[:upper:]' '[:lower:]')
-          echo "uname_sys: $uname_sys"
-          commit_sha=$(sed <.ic-commit 's/#.*$//' | sed '/^$/d')
-          echo "commit sha: $commit_sha"
-          curl -sLO "https://download.dfinity.systems/ic/$commit_sha/binaries/x86_64-$uname_sys/ic-test-state-machine.gz"
-          gzip -d ic-test-state-machine.gz
-          chmod a+x ic-test-state-machine
-          ./ic-test-state-machine --version
+          curl -sL -o pocket-ic.gz https://github.com/dfinity/pocketic/releases/download/6.0.0/pocket-ic-x86_64-${{ matrix.os == 'macos-latest' && 'darwin' || 'linux' }}.gz
+          gzip -d pocket-ic.gz
+          chmod +x pocket-ic
 
-      - name: 'Download II wasm'
+      - name: "Download II wasm"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_test_cached.wasm.gz
           path: .
 
-      - name: 'Download archive wasm'
+      - name: "Download archive wasm"
         uses: actions/download-artifact@v4
         with:
           name: archive.wasm.gz
           path: .
+
+      - name: Run PocketIc
+        run: ./pocket-ic --port-file pocket-ic-port &
 
       - name: Run Tests
         run: |
@@ -461,30 +390,89 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+  test-canisters-script:
+    needs: [cached-build, docker-build-archive]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            ~/.cargo
+            target
+          key: ${{ runner.os }}-test-canisters-script-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.node-version', 'package-lock.json') }}
+
+      - name: "Download II wasm"
+        uses: actions/download-artifact@v4
+        with:
+          name: internet_identity_test_cached.wasm.gz
+          path: .
+
+      - name: "Download archive wasm"
+        uses: actions/download-artifact@v4
+        with:
+          name: archive.wasm.gz
+          path: .
+
+      - name: Move wasms
+        run: mv internet_identity_test.wasm.gz internet_identity.wasm.gz
+
+      - name: Create dummy assets
+        run: |
+          mkdir dist
+          touch dist/index.html
+
+      - name: Run tests
+        # should_keep_new_anchor_across_rollback uses previous II wasm
+        # should_issue_same_principal_after_restoring_backup uses a stable memory backup
+        # should_keep_entries_across_rollback uses previous archive wasm
+        # should_report_daily_active_anchors tests stats
+        # should_get_different_id_alias_for_different_relying_parties tests VCs
+        # should_get_valid_delegation tests II core functionality
+        run: |
+          ./scripts/test-canisters.sh --no-build should_keep_new_anchor_across_rollback
+          ./scripts/test-canisters.sh --no-build should_issue_same_principal_after_restoring_backup
+          ./scripts/test-canisters.sh --no-build should_keep_entries_across_rollback
+          ./scripts/test-canisters.sh --no-build should_report_daily_active_anchors
+          ./scripts/test-canisters.sh --no-build should_get_different_id_alias_for_different_relying_parties
+          ./scripts/test-canisters.sh --no-build should_get_valid_delegation
+
   ######################
   # The end-to-end tests #
   ######################
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: [cached-build, test-app-build, vc_demo_issuer-build]
     strategy:
       matrix:
-        device: [ 'desktop', 'mobile' ]
+        device: ["desktop", "mobile"]
         # We run the integration tests on both the official and legacy domains, to make sure
-        # the webapp (routes, csp, etc) works on both.
-        domain: [ 'https://identity.internetcomputer.org', 'https://identity.ic0.app' ]
+        # the webapp (routes, csp, etc) works on both. Captchas are statically enabled on one
+        # domain and disabled on the other.
+        # Both settings are combined in one single matrix variable as otherwise there would be
+        # excessively many combinations to be run and it would be questionable how much more of
+        # a signal we would get from that.
+        settings:
+          [
+            {
+              domain: "https://identity.internetcomputer.org",
+              captcha: "enabled",
+            },
+            { domain: "https://identity.ic0.app", captcha: "disabled" },
+          ]
         # Specify some shards for jest (a jest instance will only run a subset of files
         # based on the shard assigned to it)
         # The jest parameter is actually 1/N, 2/N etc but we use a artifact-friendly
         # version here (with underscore).
-        shard: [ '1_6', '2_6', '3_6', '4_6', '5_6', '6_6' ]
+        shard: ["1_6", "2_6", "3_6", "4_6", "5_6", "6_6"]
       # Make sure that one failing test does not cancel all other matrix jobs
       fail-fast: false
 
     env:
       # Suffix used for tagging artifacts
-      artifact_suffix: ${{ contains(matrix.domain, 'internetcomputer') && 'current' || 'legacy' }}-${{ matrix.device }}-${{ matrix.shard }}
+      artifact_suffix: ${{ contains(matrix.settings.domain, 'internetcomputer') && 'current' || 'legacy' }}-${{ matrix.device }}-captcha_${{ matrix.settings.captcha }}-${{ matrix.shard }}
 
     steps:
       - uses: actions/checkout@v4
@@ -495,7 +483,7 @@ jobs:
       - name: Kickstart npm ci
         run: '{ npm ci --no-audit --no-fund; echo "$?" > ~/npm-ci-status; } &'
 
-      - uses: ./.github/actions/setup-dfx
+      - uses: dfinity/setup-dfx@e50c04f104ee4285ec010f10609483cf41e4d365
 
       # Helps with debugging
       - name: Show versions
@@ -505,22 +493,22 @@ jobs:
           echo node --version
           node --version
 
-      - name: 'Run dfx'
+      - name: "Run dfx"
         run: dfx start --background --artificial-delay 0
 
-      - name: 'Download II wasm'
+      - name: "Download II wasm"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_test_cached.wasm.gz
           path: .
 
-      - name: 'Download test app wasm'
+      - name: "Download test app wasm"
         uses: actions/download-artifact@v4
         with:
           name: test_app.wasm
           path: demos/test-app
 
-      - name: 'Download VC issuer wasm'
+      - name: "Download VC issuer wasm"
         uses: actions/download-artifact@v4
         with:
           name: vc_demo_issuer.wasm.gz
@@ -531,12 +519,14 @@ jobs:
 
       - name: Deploy canisters
         run: |
-          dfx canister install internet_identity --wasm internet_identity_test.wasm.gz
+          captcha_flag="${{ matrix.settings.captcha }}"
+          # Build the "CaptchaEnabled" / "CaptchaDisabled" variants from the matrix captcha value
+          # (i.e. capitalize the first letter)
+          captcha_variant="Captcha$(tr '[:lower:]' '[:upper:]' <<< ${captcha_flag:0:1})${captcha_flag:1}"
+          # NOTE: dfx install will run the postinstall scripts from dfx.json
+          dfx canister install internet_identity --wasm internet_identity_test.wasm.gz --argument "(opt record { captcha_config = opt record { max_unsolved_captchas= 50:nat64; captcha_trigger = variant {Static = variant { $captcha_variant }}}})"
           dfx canister install test_app --wasm demos/test-app/test_app.wasm
           dfx canister install issuer --wasm demos/vc_issuer/vc_demo_issuer.wasm.gz
-
-      - name: Provision issuer canister
-        run: ./demos/vc_issuer/provision
 
       # Check the return code of npm ci
       - name: Check on npm ci
@@ -557,9 +547,10 @@ jobs:
       # NOTE: we run chrome in headless mode because that's the only thing that works in GHA
       # NOTE: the last bit (tr) replaces 1_N with 1/N
       - run: |
-          II_URL=${{ matrix.domain }} \
+          II_URL=${{ matrix.settings.domain }} \
             SCREEN=${{ matrix.device }} \
             II_E2E_CHROME_OPTS="--headless" \
+            II_CAPTCHA=${{ matrix.settings.captcha }} \
             npm run test:e2e -- --shard=$(tr <<<'${{ matrix.shard }}' -s _ /)
 
       - name: Stop dfx
@@ -588,24 +579,19 @@ jobs:
 
   # Aggregate all e2e matrix jobs, used in branch protection
   e2e-all:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: e2e
     steps:
       - run: echo e2e ok
 
   using-dev-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: docker-build-ii
     steps:
       - uses: actions/checkout@v4
 
-      - run: |
-          sudo apt-get update
-          sudo apt-get --only-upgrade install google-chrome-stable
-          google-chrome --version
-
       - uses: ./.github/actions/setup-node
-      - uses: ./.github/actions/setup-dfx
+      - uses: dfinity/setup-dfx@e50c04f104ee4285ec010f10609483cf41e4d365
 
       # Helps with debugging
       - name: Show versions
@@ -617,7 +603,7 @@ jobs:
         run: |
           dfx start --background --artificial-delay 0
 
-      - name: 'Download wasm'
+      - name: "Download wasm"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_dev.wasm.gz
@@ -654,27 +640,33 @@ jobs:
   # This deploys the production build to mainnet (to a canister that we use for release testing) alongside
   # some other canisters useful for testing & playing with II.
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/release-')
-    needs: [docker-build-internet_identity_production, docker-build-archive, test-app-build, vc_demo_issuer-build]
+    needs:
+      [
+        docker-build-ii,
+        docker-build-archive,
+        test-app-build,
+        vc_demo_issuer-build,
+      ]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup-dfx
+      - uses: dfinity/setup-dfx@e50c04f104ee4285ec010f10609483cf41e4d365
 
-      - name: 'Download II wasm'
+      - name: "Download II wasm"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_production.wasm.gz
           path: .
 
-      - name: 'Download archive wasm'
+      - name: "Download archive wasm"
         uses: actions/download-artifact@v4
         with:
           name: archive.wasm.gz
           path: .
 
-      - name: 'Install key'
+      - name: "Install key"
         env:
           DFX_DEPLOY_KEY: ${{ secrets.DFX_DEPLOY_KEY }}
         run: |
@@ -692,7 +684,7 @@ jobs:
             --wasm internet_identity_production.wasm.gz \
             fgte5-ciaaa-aaaad-aaatq-cai
 
-      - name: 'Download test app wasm'
+      - name: "Download test app wasm"
         uses: actions/download-artifact@v4
         with:
           name: test_app.wasm
@@ -705,7 +697,7 @@ jobs:
             --wasm ./test_app.wasm \
             vt36r-2qaaa-aaaad-aad5a-cai
 
-      - name: 'Download VC issuer wasm'
+      - name: "Download VC issuer wasm"
         uses: actions/download-artifact@v4
         with:
           name: vc_demo_issuer.wasm.gz
@@ -720,53 +712,53 @@ jobs:
           ./demos/vc_issuer/provision \
             --ii-canister-id fgte5-ciaaa-aaaad-aaatq-cai \
             --dfx-network ic \
-            --issuer-canister v2yvn-myaaa-aaaad-aad4q-cai
+            --issuer-canister v2yvn-myaaa-aaaad-aad4q-cai \
+            --wallet "$wallet"
 
       - name: "Deploy archive"
         run: scripts/deploy-archive --wasm archive.wasm.gz --canister-id fgte5-ciaaa-aaaad-aaatq-cai --network ic
 
-
   # This prepares all the files necessary for a release (all flavors of Wasm, release notes).
   # On release tags, a new release is created and the assets are uploaded.
   release:
-    runs-on: ubuntu-latest
-    needs: [docker-build-internet_identity_production, docker-build-archive, vc_demo_issuer-build]
+    runs-on: ubuntu-22.04
+    needs: [docker-build-ii, docker-build-archive, vc_demo_issuer-build]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: 'Download test build'
+      - name: "Download test build"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_test.wasm.gz
           path: .
 
-      - name: 'Download dev build'
+      - name: "Download dev build"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_dev.wasm.gz
           path: .
 
-      - name: 'Download production build'
+      - name: "Download production build"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_production.wasm.gz
           path: .
 
-      - name: 'Download archive'
+      - name: "Download archive"
         uses: actions/download-artifact@v4
         with:
           name: archive.wasm.gz
           path: .
 
-      - name: 'Download issuer'
+      - name: "Download issuer"
         uses: actions/download-artifact@v4
         with:
           name: vc_demo_issuer.wasm.gz
           path: .
 
-      - name: 'Get GHA job IDs'
-        uses: actions/github-script@v6
+      - name: "Get GHA job IDs"
+        uses: actions/github-script@v7
         id: pipeline-jobs
         with:
           script: |
@@ -781,8 +773,8 @@ jobs:
                   html_url: job.html_url}
               });
 
-      - name: 'Get latest release'
-        uses: actions/github-script@v6
+      - name: "Get latest release"
+        uses: actions/github-script@v7
         id: latest-release-tag
         with:
           result-encoding: string
@@ -793,8 +785,8 @@ jobs:
       # it on its own, GitHub is really bad at figuring which tag to use as the previous tag (for
       # listing contributions since).
       # https://github.com/github/feedback/discussions/5975
-      - name: 'Generate CHANGELOG'
-        uses: actions/github-script@v6
+      - name: "Generate CHANGELOG"
+        uses: actions/github-script@v7
         id: changelog
         with:
           result-encoding: string
@@ -833,6 +825,13 @@ jobs:
       - name: Release notes
         run: cat ${{ steps.prepare-release.outputs.notes-file }}
 
+      # Create a sha file for dfx pull, referenced by the metadata set in the build
+      - name: Create sha for dfx pull
+        run: |
+          shasum -a 256 \
+            ./internet_identity_dev.wasm.gz > \
+            ./internet_identity_dev.wasm.gz.sha256
+
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/release-')
         run: |
@@ -842,6 +841,7 @@ jobs:
             -- \
             internet_identity_production.wasm.gz \
             internet_identity_dev.wasm.gz \
+            internet_identity_dev.wasm.gz.sha256 \
             internet_identity_test.wasm.gz \
             src/internet_identity/internet_identity.did \
             archive.wasm.gz \
@@ -850,7 +850,6 @@ jobs:
           # populated by GitHub Actions
           # https://docs.github.com/en/actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
 
         # Bump the version in the download links and create A Pull Request
       - name: Update README
@@ -864,7 +863,7 @@ jobs:
 
       - name: Create Pull Request
         if: startsWith(github.ref, 'refs/tags/release-')
-        uses: peter-evans/create-pull-request@v4
+        uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GIX_BOT_PAT }}
           base: main
@@ -874,7 +873,7 @@ jobs:
           author: gix-bot <gix-bot@users.noreply.github.com>
           branch: bot-release-readme-update
           delete-branch: true
-          title: 'Update release in README'
+          title: "Update release in README"
 
         # Since this may be triggered on tag push, a failure won't be shown on any
         # PR status. To notify the team, we send a message to our Slack channel on failure.
@@ -912,11 +911,11 @@ jobs:
           II_FETCH_ROOT_KEY: 1
           II_DUMMY_CAPTCHA: 1
           II_DUMMY_AUTH: 0
-          II_INSECURE_REQUESTS: 0
+          II_DEV_CSP: 0
         run: ./scripts/build
 
       - run: mv internet_identity.wasm.gz internet_identity_test.wasm.gz
-      - name: 'Upload test build'
+      - name: "Upload test build"
         uses: actions/upload-artifact@v4
         with:
           # name is the name used to display and retrieve the artifact
@@ -931,13 +930,13 @@ jobs:
     needs: [docker-build-ii, cached-build]
     steps:
       - uses: actions/checkout@v4
-      - name: 'Download docker build'
+      - name: "Download docker build"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_test.wasm.gz
           path: .
       - run: mv internet_identity_test.wasm.gz docker.wasm.gz
-      - name: 'Download native cached build'
+      - name: "Download native cached build"
         uses: actions/download-artifact@v4
         with:
           name: internet_identity_test_cached.wasm.gz
@@ -963,12 +962,12 @@ jobs:
         # (in particular the slow macos builds). A single ubuntu build is not long and gives us some signal.
         # XXX: GHA does not support proper if/else so we implement a workaround: https://github.com/actions/runner/issues/409
         # XXX: GHA fails if we return the matrix object directly, so we have to pretend it's JSON
-        os: ${{ github.ref == 'refs/heads/main' && fromJson('[ "ubuntu-22.04", "ubuntu-20.04", "macos-11", "macos-12" ]') || fromJson('[ "ubuntu-22.04" ]') }}
+        os: ${{ github.ref == 'refs/heads/main' && fromJson('[ "ubuntu-22.04", "ubuntu-20.04", "macos-13", "macos-14" ]') || fromJson('[ "ubuntu-22.04" ]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/check-build
       - run: mv internet_identity.wasm.gz internet_identity_clean_build_${{ matrix.os }}.wasm.gz
-      - name: 'Upload clean build'
+      - name: "Upload clean build"
         uses: actions/upload-artifact@v4
         with:
           # name is the name used to display and retrieve the artifact
@@ -977,10 +976,8 @@ jobs:
           # file when downloaded
           path: internet_identity_clean_build_${{ matrix.os }}.wasm.gz
 
-
-
   verify-clean-build-hash:
-    needs: ['clean-build', 'docker-build-internet_identity_production']
+    needs: ["clean-build", "docker-build-ii"]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -1016,9 +1013,8 @@ jobs:
             exit 1
           fi
 
-
   interface-compatibility:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-didc
@@ -1026,3 +1022,14 @@ jobs:
         run: |
           curl -sSL https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity.did -o internet_identity_previous.did
           didc check src/internet_identity/internet_identity.did internet_identity_previous.did
+
+  sig-verifier-js:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-node
+      - run: npm ci
+      - name: Build sig-verifier
+        run: npm run --workspace ./src/sig-verifier-js build
+      - name: Run sig-verifier tests
+        run: npm run --workspace ./src/sig-verifier-js test

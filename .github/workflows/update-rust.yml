@@ -5,11 +5,11 @@ name: Rust Update
 on:
   schedule:
     # check for new rust versions weekly
-    - cron:  '30 3 * * FRI'
+    - cron: "30 3 * * FRI"
 
 jobs:
   rust-update:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +48,7 @@ jobs:
         # If the rust-toolchain was updated, create a PR.
       - name: Create Pull Request
         if: ${{ steps.update.outputs.updated == '1' }}
-        uses: peter-evans/create-pull-request@v4
+        uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GIX_BOT_PAT }}
           base: main
@@ -58,7 +58,7 @@ jobs:
           author: gix-bot <gix-bot@users.noreply.github.com>
           branch: bot-rust-update
           delete-branch: true
-          title: 'Update rust version'
+          title: "Update rust version"
 
         # Since the this is a scheduled job, a failure won't be shown on any
         # PR status. To notify the team, we send a message to our Slack channel on failure.

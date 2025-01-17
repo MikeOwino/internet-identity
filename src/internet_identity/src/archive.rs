@@ -3,9 +3,8 @@ use crate::storage::anchor::Device;
 use candid::{CandidType, Deserialize, Principal};
 use ic_cdk::api::call::{call_with_payment, CallResult};
 use ic_cdk::api::management_canister::main::{
-    canister_status, install_code, CanisterIdRecord, CanisterInstallMode,
-    CanisterInstallMode::Install, CanisterStatusResponse, CreateCanisterArgument,
-    InstallCodeArgument,
+    canister_status, install_code, CanisterIdRecord, CanisterInstallMode, CanisterStatusResponse,
+    CreateCanisterArgument, InstallCodeArgument,
 };
 use ic_cdk::api::time;
 use ic_cdk::{call, caller, id, trap};
@@ -14,10 +13,8 @@ use internet_identity_interface::internet_identity::types::*;
 use serde_bytes::ByteBuf;
 use sha2::Digest;
 use sha2::Sha256;
-use std::rc::Rc;
 use std::time::Duration;
 use ArchiveState::{Configured, Created, CreationInProgress, NotConfigured};
-use CanisterInstallMode::Upgrade;
 
 /// State of the archive canister.
 #[derive(Eq, PartialEq, Clone, CandidType, Debug, Deserialize, Default)]
@@ -54,12 +51,12 @@ pub struct ArchiveData {
     pub sequence_number: u64,
     // Canister id of the archive canister
     pub archive_canister: Principal,
-    // Entries to be fetched by the archive canister sorted in ascending order by sequence_number.
-    // Once the limit has been reached, II will refuse further changes to anchors in stable memory
-    // until the archive acknowledges entries and they can safely be deleted from this buffer.
-    // The limit is configurable (entries_buffer_limit).
-    // This is an Rc to avoid unnecessary copies of (potentially) a lot of data when cloning.
-    pub entries_buffer: Rc<Vec<BufferedEntry>>,
+}
+
+impl ArchiveData {
+    pub fn buffered_entries_count(&self) -> usize {
+        state::storage_borrow(|s| s.archive_entries_count())
+    }
 }
 
 /// Cached archive status information
@@ -117,13 +114,13 @@ pub async fn deploy_archive(wasm: ByteBuf) -> DeployArchiveResult {
                 Ok(archive) => archive,
                 Err(err) => return DeployArchiveResult::Failed(err),
             };
-            (archive, Install)
+            (archive, CanisterInstallMode::Install)
         }
         ReducedArchiveState::Created(data) => {
             let status = archive_status(data.archive_canister).await;
             match status.canister_status.module_hash {
-                None => (data.archive_canister, Install),
-                Some(_) => (data.archive_canister, Upgrade),
+                None => (data.archive_canister, CanisterInstallMode::Install),
+                Some(_) => (data.archive_canister, CanisterInstallMode::Upgrade(None)),
             }
         }
     };
@@ -154,7 +151,7 @@ async fn archive_change_required(archive_canister: Principal, config: &ArchiveCo
 
     if !status
         .init
-        .map_or(false, |init| init == config_to_init(config))
+        .is_some_and(|init| init == config_to_init(config))
     {
         // the init arguments have changed --> deployment required regardless of wasm hash
         return true;
@@ -190,7 +187,6 @@ async fn create_archive(config: ArchiveConfig) -> Result<Principal, String> {
                     data: ArchiveData {
                         sequence_number: 0,
                         archive_canister: canister_id,
-                        entries_buffer: Rc::new(vec![]),
                     },
                     config,
                 }
@@ -317,8 +313,7 @@ pub fn archive_operation(anchor_number: AnchorNumber, caller: Principal, operati
         return;
     };
 
-    // For layout versions < 6 this will always be false because nothing is ever added to the buffer
-    if data.entries_buffer.len() as u64 >= config.entries_buffer_limit {
+    if data.buffered_entries_count() as u64 >= config.entries_buffer_limit {
         trap("cannot archive operation, archive entries buffer limit reached")
     }
 
@@ -330,16 +325,16 @@ pub fn archive_operation(anchor_number: AnchorNumber, caller: Principal, operati
         caller,
         sequence_number: data.sequence_number,
     };
-    let encoded_entry = candid::encode_one(entry).expect("failed to encode archive entry");
+    let buffered_entry = BufferedEntry {
+        anchor_number,
+        timestamp,
+        entry: ByteBuf::from(candid::encode_one(entry).expect("failed to encode archive entry")),
+        sequence_number: data.sequence_number,
+    };
 
     // add entry to buffer (which is emptied by the archive periodically, see fetch_entries and acknowledge entries)
-    state::archive_data_mut(|data| {
-        Rc::make_mut(&mut data.entries_buffer).push(BufferedEntry {
-            anchor_number,
-            timestamp,
-            entry: ByteBuf::from(encoded_entry),
-            sequence_number: data.sequence_number,
-        });
+    state::storage_borrow_mut(|s| {
+        s.add_archive_entry(buffered_entry);
     });
 
     state::archive_data_mut(|data| {
@@ -354,12 +349,8 @@ pub fn fetch_entries() -> Vec<BufferedEntry> {
     trap_if_caller_not_archive(&data);
 
     // buffered entries are ordered by sequence number
-    // i.e. this takes the lowest entries_fetch_limit many entries
-    data.entries_buffer
-        .iter()
-        .take(config.entries_fetch_limit as usize)
-        .cloned()
-        .collect()
+    // i.e. this takes the first (by sequence numbers) entries_fetch_limit many entries
+    state::storage_borrow_mut(|s| s.get_archive_entries(config.entries_fetch_limit))
 }
 
 pub fn acknowledge_entries(sequence_number: u64) {
@@ -370,7 +361,7 @@ pub fn acknowledge_entries(sequence_number: u64) {
         trap_if_caller_not_archive(data);
 
         // Only keep entries with higher sequence number as the highest acknowledged.
-        Rc::make_mut(&mut data.entries_buffer).retain(|e| e.sequence_number > sequence_number)
+        state::storage_borrow_mut(|s| s.prune_archive_entries(sequence_number))
     });
 }
 

@@ -22,8 +22,6 @@ pub mod vc_mvp;
 // without breaking clients
 pub use api_v2::*;
 
-pub struct Base64(pub String);
-
 #[derive(Eq, PartialEq, Clone, Debug, CandidType, Deserialize)]
 pub struct DeviceData {
     pub pubkey: DeviceKey,
@@ -190,14 +188,22 @@ pub struct AnchorCredentials {
     pub recovery_phrases: Vec<PublicKey>,
 }
 
-#[derive(Clone, Debug, CandidType, Deserialize, Default)]
+/// Init arguments of II which can be supplied on install and upgrade.
+///
+/// Each field is wrapped in `Option<>` to indicate whether the field should
+/// keep the previous value or update to a new value (e.g. `None` keeps the previous value).
+///
+/// Some fields, like `openid_google`, have an additional nested `Option<>`, this indicates
+/// enable/disable status (e.g. `Some(None)` disables a feature while `None` leaves it untouched).
+#[derive(Clone, Debug, CandidType, Deserialize, Default, Eq, PartialEq)]
 pub struct InternetIdentityInit {
     pub assigned_user_number_range: Option<(AnchorNumber, AnchorNumber)>,
     pub archive_config: Option<ArchiveConfig>,
     pub canister_creation_cycles_cost: Option<u64>,
     pub register_rate_limit: Option<RateLimitConfig>,
-    pub max_num_latest_delegation_origins: Option<u64>,
-    pub max_inflight_captchas: Option<u64>,
+    pub captcha_config: Option<CaptchaConfig>,
+    pub related_origins: Option<Vec<String>>,
+    pub openid_google: Option<Option<OpenIdConfig>>,
 }
 
 #[derive(Clone, Debug, CandidType, Deserialize, Eq, PartialEq)]
@@ -207,8 +213,10 @@ pub struct InternetIdentityStats {
     pub archive_info: ArchiveInfo,
     pub canister_creation_cycles_cost: u64,
     pub storage_layout_version: u8,
-    pub max_num_latest_delegation_origins: u64,
-    pub latest_delegation_origins: Vec<FrontendHostname>,
+    /// Aggregations of events that have been processed by the II.
+    /// The map contains a key for each aggregation type, and the value is a list of tuples
+    /// from aggregated sub-key (i.e. for prepare_delegation it's the frontend origin) to weight.
+    pub event_aggregations: HashMap<String, Vec<(String, u64)>>,
 }
 
 /// Information about the archive.
@@ -226,6 +234,28 @@ pub struct RateLimitConfig {
     pub time_per_token_ns: u64,
     // How many tokens are at most generated (to accommodate peaks).
     pub max_tokens: u64,
+}
+
+#[derive(Clone, Debug, CandidType, Deserialize, Eq, PartialEq)]
+pub struct CaptchaConfig {
+    pub max_unsolved_captchas: u64,
+    pub captcha_trigger: CaptchaTrigger,
+}
+
+#[derive(Clone, Debug, CandidType, Deserialize, Eq, PartialEq)]
+pub enum CaptchaTrigger {
+    Dynamic {
+        threshold_pct: u16,
+        current_rate_sampling_interval_s: u64,
+        reference_rate_sampling_interval_s: u64,
+    },
+    Static(StaticCaptchaTrigger),
+}
+
+#[derive(Clone, Debug, CandidType, Deserialize, Eq, PartialEq)]
+pub enum StaticCaptchaTrigger {
+    CaptchaEnabled,
+    CaptchaDisabled,
 }
 
 /// Configuration parameters of the archive to be used on the next deployment.
@@ -250,4 +280,9 @@ pub enum DeployArchiveResult {
     CreationInProgress,
     #[serde(rename = "failed")]
     Failed(String),
+}
+
+#[derive(Clone, Debug, CandidType, Deserialize, Default, Eq, PartialEq)]
+pub struct OpenIdConfig {
+    pub client_id: String,
 }

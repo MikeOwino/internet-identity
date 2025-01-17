@@ -12,7 +12,7 @@ use lazy_static::lazy_static;
 use serde::Serialize;
 use sha2::Digest;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const IC_CERTIFICATE_HEADER: &str = "IC-Certificate";
 pub const IC_CERTIFICATE_EXPRESSION_HEADER: &str = "IC-CertificateExpression";
@@ -98,11 +98,12 @@ impl CertifiedAssets {
             content_type.to_mime_type_string(),
         ));
 
-        // Add caching header for fonts only
-        if content_type == ContentType::WOFF2 {
+        // Cache all assets with "cacheable" in the url path
+        // Since the filenames are hashed, they will be reloaded only if the files change
+        if url_path.contains("cacheable") {
             headers.push((
                 "Cache-Control".to_string(),
-                "public, max-age=604800".to_string(), // cache for 1 week
+                "public, max-age=31536000".to_string(), // cache for 1 year
             ));
         }
 
@@ -268,7 +269,7 @@ impl CertifiedAssets {
         &self,
         absolute_path: &str,
         sigs_tree: Option<HashTree>,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<HeaderField> {
         let certificate = data_certificate().unwrap_or_else(|| {
             trap("data certificate is only available in query calls");
         });
@@ -380,6 +381,15 @@ impl ContentType {
 
 lazy_static! {
     pub static ref EXPR_HASH: Hash = sha2::Sha256::digest(IC_CERTIFICATE_EXPRESSION).into();
+    // Some files served by a canister are by definitions required not to have extensions,
+    // so we white-list them and their predefined type & encoding.
+    static ref KNOWN_FILES: HashMap<PathBuf, (ContentType, ContentEncoding)> = {
+        let mut map = HashMap::new();
+        map.insert(Path::new(".well-known/ic-domains").to_owned(), (ContentType::JSON, ContentEncoding::Identity));
+        map.insert(Path::new(".well-known/ii-alternative-origins").to_owned(), (ContentType::JSON, ContentEncoding::Identity));
+        map.insert(Path::new(".well-known/webauthn").to_owned(), (ContentType::JSON, ContentEncoding::Identity));
+        map
+    };
 }
 
 fn response_hash(status_code: u16, headers: &[HeaderField], body_hash: &Hash) -> Hash {
@@ -456,14 +466,22 @@ fn collect_assets_rec(dir: &Dir, assets: &mut Vec<Asset>) {
     }
 }
 
-/// Returns the content type and the encoding type of the given file, based on the extension(s).
+/// Returns the content type and the encoding type of the given file, either
+/// because the file is on a "white-list" of known files, or based on the extension(s),
 /// If the text after the last dot is "gz" (i.e. this is a gzipped file), then content type
 /// is determined by the text after the second to last dot and the last dot in the file name,
 /// e.g. `ContentType::JS` for "some.gzipped.file.js.gz", and the encoding is `ContentEncoding::GZip`.
 /// Otherwise the content type is determined by the text after the last dot in the file name,
 /// and the encoding is `ContentEncoding::Identity`.
 fn content_type_and_encoding(asset_path: &Path) -> (ContentType, ContentEncoding) {
-    let extension = asset_path.extension().unwrap().to_str().unwrap();
+    if let Some((content_type, content_encoding)) = KNOWN_FILES.get(asset_path) {
+        return (*content_type, *content_encoding);
+    }
+    let extension = asset_path
+        .extension()
+        .unwrap_or_else(|| panic!("Unsupported file without extension: {:?}", asset_path))
+        .to_str()
+        .unwrap();
     let (extension, encoding) = if extension == "gz" {
         let type_extension = asset_path
             .file_name()
@@ -623,6 +641,21 @@ fn test_filepath_urlpaths() {
 #[test]
 fn should_return_correct_extension() {
     let path_extension_encoding = [
+        (
+            ".well-known/ic-domains",
+            ContentType::JSON,
+            ContentEncoding::Identity,
+        ),
+        (
+            ".well-known/webauthn",
+            ContentType::JSON,
+            ContentEncoding::Identity,
+        ),
+        (
+            ".well-known/ii-alternative-origins",
+            ContentType::JSON,
+            ContentEncoding::Identity,
+        ),
         (
             "path1/some_css_file.css",
             ContentType::CSS,

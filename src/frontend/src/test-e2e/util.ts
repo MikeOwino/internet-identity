@@ -95,7 +95,7 @@ export async function runInBrowser(
   const browser = await remoteRetry({
     capabilities: {
       browserName: "chrome",
-      browserVersion: "119.0.6045.105", // More information about available versions can be found here: https://github.com/GoogleChromeLabs/chrome-for-testing
+      browserVersion: "122.0.6261.111", // More information about available versions can be found here: https://github.com/GoogleChromeLabs/chrome-for-testing
       "goog:chromeOptions": chromeOptions,
     },
   });
@@ -446,8 +446,8 @@ export async function waitToClose(browser: WebdriverIO.Browser): Promise<void> {
   await browser.waitUntil(
     async () => (await browser.getWindowHandles()).length == 1,
     {
-      timeout: 10_000,
-      timeoutMsg: "expected only one window to exist after 10s",
+      timeout: 20_000, // this is relatively long, but we observed flakiness when just waiting for 10 seconds
+      timeoutMsg: "expected only one window to exist after 20s",
     }
   );
   const handles = await browser.getWindowHandles();

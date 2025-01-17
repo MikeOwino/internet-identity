@@ -1,6 +1,6 @@
 use crate::http::metrics::metrics;
 use crate::state;
-use canister_sig_util::signature_map::LABEL_SIG;
+use ic_canister_sig_creation::signature_map::LABEL_SIG;
 use ic_certification::{labeled_hash, pruned};
 use internet_identity_interface::http_gateway::{HeaderField, HttpRequest, HttpResponse};
 use serde_bytes::ByteBuf;
@@ -181,10 +181,15 @@ fn content_security_policy_header(integrity_hashes: Vec<String>) -> String {
         )
     };
 
+    let connect_src = "'self' https:";
+
+    // Allow connecting via http for development purposes
+    #[cfg(feature = "dev_csp")]
+    let connect_src = format!("{connect_src} http:");
     let csp = format!(
         "default-src 'none';\
-         connect-src 'self' https://identity.internetcomputer.org https://icp-api.io https://*.icp0.io https://*.ic0.app;\
-         img-src 'self' data:;\
+         connect-src {connect_src};\
+         img-src 'self' data: https://*.googleusercontent.com;\
          script-src {strict_dynamic} 'unsafe-inline' 'unsafe-eval' https:;\
          base-uri 'none';\
          form-action 'none';\
@@ -193,7 +198,8 @@ fn content_security_policy_header(integrity_hashes: Vec<String>) -> String {
          font-src 'self';\
          frame-ancestors 'none';"
     );
-    #[cfg(not(feature = "insecure_requests"))]
+    // for the dev build skip upgrading all connections to II to https
+    #[cfg(not(feature = "dev_csp"))]
     let csp = format!("{csp}upgrade-insecure-requests;");
     csp
 }

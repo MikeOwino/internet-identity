@@ -131,6 +131,13 @@
   --vc-brand-alt: rgba(215, 205, 235, 1);
   --vc-grey: grey;
   --vc-light-grey: #d4d8e5;
+  --vc-brand-gradient: radial-gradient(
+      at 100% 100%,
+      hsla(265, 80%, 75%, 1) 0px,
+      transparent 50%
+    ),
+    radial-gradient(at 100% 0%, hsla(272, 86%, 55%, 1) 0px, transparent 50%),
+    radial-gradient(at 0% 18%, hsla(223, 79%, 66%, 1) 0px, transparent 50%);
 
   /**
    * value tokens: sizes (--vs => valueSize)
@@ -149,6 +156,8 @@
   --vs-line-height: 1.4;
 
   --vs-border-radius: 0.8rem;
+
+  --vs-screen-width: 40rem;
 
   /*
    * reference tokens
@@ -181,29 +190,31 @@
   --rc-onFooter: var(--rc-light);
 
   --rc-card: var(--rc-background-transparent);
-  --rc-card-background: var(--vc-mist);
 
   --rc-card-backdrop: transparent;
   --rc-background-card--background: transparent;
 
-  --rc-card--inverted: var(--vc-snow);
-  --rc-card--inverted-background: var(--vc-raven);
+  --rc-card--highlight-background: var(--vc-light-grey);
 
   --rc-line: var(--vc-light-grey);
   --rc-line-interaction: var(--vc-brand-purple);
   --rc-line-inverted: var(--rc-dark);
 
+  --rc-button: var(--vc-brand-purple);
+  --rc-button-pair: var(--vc-brand-purple-light);
+
   --rc-interaction: var(--vc-brand-blue);
-  --rc-interaction-text: var(--vc-brand-purple);
+  --rc-interaction-text: var(--rc-button);
   --rc-interactionHighlight-text: var(--vc-brand-purple-light);
   --rc-loading: var(--vc-brand-purple);
 
   --rc-marketing-icon: var(--vc-brand-purple);
 
-  --rc-button: var(--vc-brand-purple);
-  --rc-button-pair: var(--vc-brand-purple-light);
-
   --rc-button--disabled: var(--vc-shadow);
+
+  --rc-background-image--highlight: var(--vc-brand-gradient);
+  --rc-background--highlight: var(--vc-brand-purple);
+  --rc-background--highlight-text: var(--vc-snow);
 
   /*
     color used to elevate something from its background
@@ -256,12 +267,15 @@
   --rg-brand-bruised: var(--vc-brand-blue) 50%, var(--vc-brand-purple) 90%;
 
   /* reference tokens: sizes */
+  --rs-main-content-width: var(--vs-screen-width);
+
   --rs-inline-grid-gap: var(--vs-inline);
   --rs-inline-icon-gap: var(--vs-inline);
 
   --rs-inline-button-gap: calc(var(--vs-inline) * 1.5);
 
   --rs-stack-section: calc(var(--vs-stack) * 4);
+  --rs-stack-section--small: calc(var(--vs-stack) * 2);
   --rs-stack-section--spacious: calc(var(--vs-stack) * 5);
   --rs-stack-section--tight: var(--vs-stack);
 
@@ -270,7 +284,7 @@
 
   --rs-list-item-stack: calc(var(--vs-stack) * 1.5);
   --rs-list-parcel-bezel: var(--vs-bezel);
-  --rs-list-gutter: var(--vs-gutter);
+  --rs-list-gutter: calc(var(--vs-gutter) * 2);
 
   --rs-footer-stack: var(--vs-stack);
   --rs-footer-gutter: calc(var(--vs-gutter) * 3.5);
@@ -314,6 +328,17 @@
   --rs-line--thick: calc(var(--rs-line) * 4);
 
   --rs-footer-height: 4rem;
+
+  --rs-split-page-bezzel--mobile: calc(var(--vs-stack) * 3);
+  --rs-split-page-left-pane-bezzel: calc(var(--vs-gutter) * 8);
+  --rs-split-page-right-pane-bezzel--desktop: 10vmax;
+  --rs-split-page-right-pane-bezzel--mobile: calc(var(--vs-stack) * 4);
+  --rs-split-page-stack: calc(var(--vs-stack) * 4);
+  --rs-split-page-stack--large: calc(var(--vs-stack) * 6);
+  --rs-split-page-title: calc(2.8rem + 1vw);
+
+  /* This is not used in CSS, but it's used to compensate for the logo size. */
+  --rs-logo-height: 3rem;
 }
 
 /* II) Optional Theme Settings: DarkMode, LightMode, Product Specific stuff */
@@ -578,6 +603,10 @@ body {
   hyphens: auto;
 }
 
+.t-nowrap {
+  white-space: nowrap;
+}
+
 a,
 .t-link {
   display: inline;
@@ -756,8 +785,8 @@ a:hover,
 .l-container {
   position: relative;
   font-size: 1.6rem;
-  min-width: 40rem;
-  max-width: 40rem;
+  min-width: var(--rs-main-content-width);
+  max-width: var(--rs-main-content-width);
   /* centers the container and adds a bit of space to make sure the footer does not stick to it */
   margin: 0 auto 2rem;
 }
@@ -769,6 +798,12 @@ a:hover,
 .l-horizontal {
   display: flex;
   gap: var(--rs-inline-grid-gap);
+}
+
+.l-vertical {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
 }
 
 .l-footer {
@@ -945,6 +980,196 @@ a:hover,
 }
 
 /**
+ * LandingPage component
+ */
+
+.c-landingPage {
+  height: 100dvh;
+}
+
+.c-landingPage__container {
+  display: grid;
+  grid-template-columns: 1fr minmax(var(--rs-main-content-width), 1fr);
+  grid-template-areas: "left right";
+
+  height: 100%;
+}
+
+.c-landingPage__title {
+  font-size: var(--rs-split-page-title);
+  font-weight: 600;
+  line-height: 1.1;
+
+  display: flex;
+  flex-direction: column;
+
+  /* We don't want to break the lines of the title */
+  white-space: nowrap;
+}
+
+.c-landingPage__logo {
+  position: absolute;
+  left: var(--rs-split-page-left-pane-bezzel);
+  top: var(--rs-split-page-left-pane-bezzel);
+
+  color: var(--rc-background--highlight-text);
+}
+
+.c-landingPage__logo .c-logo {
+  padding: 0;
+}
+
+.c-landingPage__left {
+  background-image: var(--rc-background-image--highlight);
+  background-color: var(--rc-background--highlight);
+  color: var(--rc-background--highlight-text);
+
+  grid-area: left;
+
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+
+  padding: var(--rs-split-page-left-pane-bezzel);
+}
+
+.c-landingPage__left__content {
+  flex: 1;
+
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+
+  padding: 0 20%;
+
+  margin-top: var(--rs-logo-height);
+}
+
+.c-landingPage__logo--mobile {
+  display: none;
+}
+
+.c-landingPage__logo--desktop {
+  display: block;
+}
+
+.c-landingPage__right {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+
+  grid-area: right;
+
+  overflow-y: scroll;
+}
+
+.c-landingPage__right__content {
+  min-width: var(--rs-main-content-width);
+  max-width: var(--rs-main-content-width);
+  /* This is necessary in case the content is bigger than the parent. */
+  /* It keeps the start of the box at the top of the container. */
+  max-height: 90%;
+
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.c-landingPage__right__content--full-width {
+  width: 100%;
+}
+
+.c-landingPage .c-footer__link {
+  padding: 0;
+}
+
+.c-landingPage__left__footer {
+  display: flex;
+  gap: var(--rs-list-bullet-space);
+}
+
+.c-landingPage__left__footer > a:hover,
+.c-landingPage__left__footer > a:active,
+.c-landingPage__left__footer > a:focus,
+.c-landingPage__left__footer > a:visited {
+  color: var(--rc-light-transparent);
+}
+
+@media (max-width: 1024px) {
+  .c-landingPage {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+
+    background-image: var(--rc-background-image--highlight);
+    background-color: var(--rc-background--highlight);
+
+    height: auto;
+    min-height: 100vh;
+  }
+
+  .c-landingPage__container {
+    display: block;
+
+    padding: 0 var(--rs-split-page-bezzel--mobile);
+
+    width: var(--rs-main-content-width);
+  }
+
+  .c-landingPage__logo {
+    display: flex;
+    position: static;
+    top: unset;
+    left: unset;
+    justify-content: center;
+
+    order: 1;
+    color: var(--rc-background--highlight-text);
+
+    padding: var(--rs-split-page-stack) 0;
+  }
+
+  .c-landingPage__left {
+    background: none;
+    order: 2;
+
+    padding: 0;
+    margin-top: var(--rs-split-page-stack--large);
+    padding-bottom: var(--rs-split-page-stack);
+
+    gap: var(--rs-split-page-stack--large);
+  }
+
+  .c-landingPage__left__content {
+    display: none;
+  }
+
+  .c-landingPage__right {
+    order: 1;
+
+    background: var(--rc-light);
+    border-radius: var(--rs-card-border-radius);
+    padding: var(--rs-split-page-right-pane-bezzel--mobile);
+
+    overflow: auto;
+  }
+
+  .c-landingPage__right__content {
+    min-width: auto;
+    max-width: none;
+    width: 100%;
+  }
+}
+
+@media (max-width: 512px) {
+  .c-landingPage__container {
+    width: 100%;
+  }
+}
+
+/**
  * Card components
  */
 
@@ -968,6 +1193,10 @@ a:hover,
   left: 50%;
   transform: translate(-50%, -50%);
   max-width: 100%;
+}
+
+.c-card--hide-overflow {
+  overflow: hidden;
 }
 
 /* c-cards pretty much fill up the screen on small devices so we disable rounding */
@@ -1036,45 +1265,15 @@ a:hover,
   --bezel-x: var(--rs-card-bezel-narrow);
   --bezel-y: var(--rs-card-bezel-narrow);
 
-  background-color: var(--rc-card--inverted-background);
-  color: var(--rc-card--inverted);
-
   max-height: 60vh;
 
   overflow-y: auto;
 
-  /* if the context is scrollable it will show with some fancy shadow in the direction of the scroll */
-  background:
-      /* Shadow Cover TOP */ linear-gradient(
-        var(--rc-card--inverted-background) 30%,
-        rgba(0, 0, 0, 0)
-      )
-      center top,
-    /* Shadow Cover BOTTOM */
-      linear-gradient(rgba(0, 0, 0, 0), var(--rc-card--inverted-background) 70%)
-      center bottom,
-    /* Shadow TOP */
-      radial-gradient(
-        farthest-side at 50% 0,
-        rgba(255, 255, 255, 0.6),
-        rgba(255, 255, 255, 0)
-      )
-      center top,
-    /* Shadow BOTTOM */
-      radial-gradient(
-        farthest-side at 50% 100%,
-        rgba(255, 255, 255, 0.6),
-        rgba(255, 255, 255, 0)
-      )
-      center bottom;
+  background-color: var(--rc-card--highlight-background);
 
-  background-color: var(--rc-card--inverted-background);
+  padding: var(--bezel-y) var(--bezel-x);
 
-  background-repeat: no-repeat;
-  background-size: 100% 2em, 100% 2em, 100% 1em, 100% 1em;
-  background-attachment: local, local, scroll, scroll;
-
-  border: var(--rs-line--thick) solid var(--rc-interaction-text);
+  border-radius: var(--rs-card-border-radius);
 }
 
 /* Card label/titles */
@@ -1106,6 +1305,22 @@ by all browsers (FF is missing) */
 
 .c-card__icon {
   height: 2rem;
+}
+
+.c-card__logo {
+  height: 4rem;
+  width: 4rem;
+  flex: 0 0 4rem;
+  position: relative;
+}
+
+.c-card__logo img {
+  height: 80%;
+  object-fit: contain;
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
 }
 
 .c-card__close {
@@ -1185,10 +1400,6 @@ by all browsers (FF is missing) */
   background: var(--rc-background);
   border-radius: var(--rs-card-border-radius);
   box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.4);
-}
-
-.c-marketing-section {
-  margin-top: calc(2 * var(--rs-marketing-block-stack));
 }
 
 .c-marketing-block {
@@ -1357,18 +1568,8 @@ by all browsers (FF is missing) */
 
 .c-logo svg {
   display: block;
-  width: 5.5rem;
-  flex: 0 0 5.5rem;
-}
-
-.c-logo__type {
-  text-align: center;
-  flex: 1 1 auto;
-  text-align: left;
-  text-transform: uppercase;
-  letter-spacing: 0.15em;
-  font-weight: 600;
-  font-size: 1.1em;
+  width: 14.5rem;
+  flex: 0 0 14.5rem;
 }
 
 .t-title + .c-logo {
@@ -1521,29 +1722,36 @@ by all browsers (FF is missing) */
   fill: currentColor;
 }
 
-.c-button--secondary {
-  background: var(--rc-button-secondary);
-  color: var(--rc-onButton-secondary);
-  border: var(--rs-line) solid var(--rc-line-interaction);
-}
-
 .c-button--textOnly {
   background: transparent;
   color: var(--rc-interaction-text);
   border: none;
 }
 
-.c-button--textOnly:hover,
-.c-button--textOnly:focus {
-  color: var(--rc-interactionHighlight-text);
-}
-
 .c-button:not([disabled]):focus,
 .c-button:not([disabled]):hover {
+  color: var(--rc-onButton);
   opacity: 0.9;
   box-shadow: 0 0 0 2px #ffffff, 0 0 3px 5px var(--rc-interaction);
   outline: 2px dotted transparent;
   outline-offset: 2px;
+  text-decoration: none;
+}
+
+.c-button--textOnly:not([disabled]):hover,
+.c-button--textOnly:not([disabled]):focus {
+  color: var(--rc-interactionHighlight-text);
+}
+
+.c-button--secondary {
+  background: var(--rc-button-secondary);
+  color: var(--rc-onButton-secondary);
+  border: var(--rs-line) solid var(--rc-line-interaction);
+}
+
+.c-button--secondary:not([disabled]):hover,
+.c-button--secondary:not([disabled]):focus {
+  color: var(--rc-onButton-secondary);
 }
 
 /* Copy pasted from the focus and hover, but with different opacity to show action */
@@ -1656,6 +1864,13 @@ by all browsers (FF is missing) */
 .c-button-group {
   display: flex;
   gap: var(--rs-inline-button-gap);
+  margin-top: var(--rs-button-stack);
+}
+
+.c-button-group--stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rs-list-gutter);
   margin-top: var(--rs-button-stack);
 }
 
@@ -2513,6 +2728,39 @@ a.c-action-list__item {
   transform: translateY(-50%);
 }
 
+.c-action-list__avatar {
+  height: 4rem;
+  width: 4rem;
+  position: relative;
+}
+
+.c-action-list__avatar img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.c-action-list__avatar--badge {
+  width: 2rem;
+  height: 2rem;
+  position: absolute;
+  bottom: -0.2rem;
+  right: -0.2rem;
+  background: var(--rc-light);
+  border-radius: 50%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--rc-line);
+}
+
+.c-action-list__avatar--badge svg {
+  width: 1.6rem;
+  height: 1.6rem;
+}
+
 .c-action-list__item + .c-action-list__item::before {
   content: "";
   display: block;
@@ -2551,6 +2799,10 @@ a.c-action-list__item {
   flex-direction: column-reverse;
   align-items: flex-start;
   justify-content: center;
+}
+
+.c-action-list__label--spacer {
+  width: 100%;
 }
 
 .c-action-list__action {
@@ -2934,6 +3186,21 @@ input[type="checkbox"] {
   animation-duration: 5s;
   animation-iteration-count: infinite;
   animation-timing-function: ease-in-out;
+  transform: translate(-50%, -50%);
+}
+
+.c-loader__link {
+  color: var(--rc-surface);
+  display: block;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, 72px);
+}
+
+.c-loader__link:hover,
+.c-loader__link:focus {
+  color: var(--rc-surface);
 }
 
 /* Wrap QR codes in a white square (for legibility) and prettify a bit */
@@ -3031,17 +3298,27 @@ input[type="checkbox"] {
   user-select: none;
 }
 
-.c-marquee__image {
+.c-marquee__image-container {
   position: absolute;
   top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+  transform: translate(0, -50%);
   height: 65%;
-  /*
-    remove the max-width set by the reset, so that the image can be as wide as
-    as required by the height
-  */
-  max-width: unset;
+  aspect-ratio: 1;
+}
+
+.c-marquee__image {
+  height: 100%;
+  width: 100%;
+  object-fit: contain;
+  transition: opacity 0.3s ease-in;
+}
+
+.c-marquee__image--loading {
+  opacity: 0;
+}
+
+.c-marquee__image--loaded {
+  opacity: 1;
 }
 
 @keyframes marquee {
@@ -3051,6 +3328,34 @@ input[type="checkbox"] {
   100% {
     transform: translateX(-100%);
   }
+}
+
+.c-separator {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--vs-stack);
+}
+
+.c-separator__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--vc-brand-purple);
+}
+
+.c-separator__dot--small {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background-color: var(--vc-brand-purple);
+}
+
+.c-separator__dot--tiny {
+  width: 2px;
+  height: 2px;
+  border-radius: 50%;
+  background-color: var(--vc-brand-purple);
 }
 
 /*
@@ -3066,6 +3371,10 @@ input[type="checkbox"] {
 
 .l-stack--spacious {
   margin-top: var(--rs-stack-section--spacious);
+}
+
+.l-stack--small {
+  margin-top: var(--rs-stack-section--small);
 }
 
 .l-stack--tight {

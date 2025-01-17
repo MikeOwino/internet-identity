@@ -3,31 +3,39 @@
  */
 import { idlFactory as internet_identity_idl } from "$generated/internet_identity_idl";
 import {
+  _SERVICE,
   AddTentativeDeviceResponse,
   AnchorCredentials,
-  Challenge,
-  ChallengeResult,
-  CredentialId,
+  AuthnMethodData,
   DeviceData,
   DeviceKey,
   FrontendHostname,
   GetDelegationResponse,
   IdAliasCredentials,
   IdentityAnchorInfo,
+  IdentityInfo,
+  IdentityInfoError,
+  IdentityMetadataReplaceError,
   KeyType,
+  MetadataMapV2,
   PreparedIdAlias,
   PublicKey,
   Purpose,
-  RegisterResponse,
+  RegistrationFlowNextStep,
   SessionKey,
   Timestamp,
   UserNumber,
   VerifyTentativeDeviceResponse,
-  WebAuthnCredential,
-  _SERVICE,
 } from "$generated/internet_identity_types";
 import { fromMnemonicWithoutValidation } from "$src/crypto/ed25519";
+import { DOMAIN_COMPATIBILITY, HARDWARE_KEY_TEST } from "$src/featureFlags";
 import { features } from "$src/features";
+import {
+  IdentityMetadata,
+  IdentityMetadataRepository,
+} from "$src/repositories/identityMetadata";
+import { JWT, MockOpenID, OpenIDCredential, Salt } from "$src/utils/mockOpenID";
+import { diagnosticInfo, unknownToString } from "$src/utils/utils";
 import {
   Actor,
   ActorSubclass,
@@ -43,9 +51,19 @@ import {
 } from "@dfinity/identity";
 import { Principal } from "@dfinity/principal";
 import { isNullish, nonNullish } from "@dfinity/utils";
-import * as tweetnacl from "tweetnacl";
+import {
+  convertToValidCredentialData,
+  CredentialData,
+} from "./credential-devices";
+import {
+  excludeCredentialsFromOrigins,
+  findWebAuthnRpId,
+  hasCredentialsFromMultipleOrigins,
+  relatedDomains,
+} from "./findWebAuthnRpId";
 import { MultiWebAuthnIdentity } from "./multiWebAuthnIdentity";
-import { RecoveryDevice, isRecoveryDevice } from "./recoveryDevice";
+import { isRecoveryDevice, RecoveryDevice } from "./recoveryDevice";
+import { supportsWebauthRoR } from "./userAgent";
 import { isWebAuthnCancel } from "./webAuthnErrorUtils";
 
 /*
@@ -76,39 +94,46 @@ export class DummyIdentity
 
 export const IC_DERIVATION_PATH = [44, 223, 0, 0, 0];
 
-export type ApiResult<T = AuthenticatedConnection> =
-  | LoginResult<T>
-  | RegisterResult<T>;
-export type LoginResult<T = AuthenticatedConnection> =
-  | LoginSuccess<T>
-  | UnknownUser
-  | AuthFail
-  | ApiError
-  | NoSeedPhrase
-  | SeedPhraseFail
-  | WebAuthnFailed;
-export type RegisterResult<T = AuthenticatedConnection> =
-  | LoginSuccess<T>
-  | AuthFail
-  | ApiError
-  | RegisterNoSpace
-  | BadChallenge
-  | WebAuthnFailed;
-
-type LoginSuccess<T = AuthenticatedConnection> = {
+export type LoginSuccess = {
   kind: "loginSuccess";
-  connection: T;
+  connection: AuthenticatedConnection;
   userNumber: bigint;
+  showAddCurrentDevice: boolean;
 };
 
-type BadChallenge = { kind: "badChallenge" };
-type UnknownUser = { kind: "unknownUser"; userNumber: bigint };
-type AuthFail = { kind: "authFail"; error: Error };
-type ApiError = { kind: "apiError"; error: Error };
-type RegisterNoSpace = { kind: "registerNoSpace" };
-type NoSeedPhrase = { kind: "noSeedPhrase" };
-type SeedPhraseFail = { kind: "seedPhraseFail" };
-type WebAuthnFailed = { kind: "webAuthnFailed" };
+export type RegFlowNextStep =
+  | { step: "checkCaptcha"; captcha_png_base64: string }
+  | { step: "finish" };
+export type RegistrationFlowStepSuccess = {
+  kind: "registrationFlowStepSuccess";
+  nextStep: RegFlowNextStep;
+};
+
+export type BadPin = { kind: "badPin" };
+export type UnknownUser = { kind: "unknownUser"; userNumber: bigint };
+export type UnexpectedCall = {
+  kind: "unexpectedCall";
+  nextStep: RegFlowNextStep;
+};
+export type NoRegistrationFlow = { kind: "noRegistrationFlow" };
+export type WrongCaptchaSolution = {
+  kind: "wrongCaptchaSolution";
+  new_captcha_png_base64: string;
+};
+export type AuthFail = { kind: "authFail"; error: Error };
+export type InvalidCaller = { kind: "invalidCaller" };
+export type RateLimitExceeded = { kind: "rateLimitExceeded" };
+export type AlreadyInProgress = { kind: "alreadyInProgress" };
+export type ApiError = { kind: "apiError"; error: Error };
+export type RegisterNoSpace = { kind: "registerNoSpace" };
+export type NoSeedPhrase = { kind: "noSeedPhrase" };
+export type SeedPhraseFail = { kind: "seedPhraseFail" };
+export type WebAuthnFailed = { kind: "webAuthnFailed" };
+export type PossiblyWrongRPID = { kind: "possiblyWrongRPID" };
+export type InvalidAuthnMethod = {
+  kind: "invalidAuthnMethod";
+  message: string;
+};
 
 export type { ChallengeResult } from "$generated/internet_identity_types";
 
@@ -123,56 +148,36 @@ export interface IIWebAuthnIdentity extends SignIdentity {
 }
 
 export class Connection {
-  public constructor(readonly canisterId: string) {}
+  // The rpID is used to get the passkey from the browser's WebAuthn API.
+  // Using different rpIDs allows us to have compatibility across multiple domains.
+  // However, when one RP ID is used and the user cancels, it must be because the user is in a device
+  // registered in another domain. In this case, we must try the other rpID.
+  // Map<userNumber, Set<rpID>>
+  private _cancelledRpIds: Map<bigint, Set<string | undefined>> = new Map();
+  protected _mockOpenID = new MockOpenID();
 
-  register = async ({
-    identity,
+  public constructor(
+    readonly canisterId: string,
+    // Used for testing purposes
+    readonly overrideActor?: ActorSubclass<_SERVICE>
+  ) {}
+
+  identity_registration_start = async ({
     tempIdentity,
-    credentialId,
-    keyType,
-    alias,
-    challengeResult,
   }: {
-    identity: SignIdentity;
     tempIdentity: SignIdentity;
-    credentialId?: CredentialId;
-    keyType: KeyType;
-    alias: string;
-    challengeResult: ChallengeResult;
-  }): Promise<RegisterResult> => {
-    let delegationIdentity: DelegationIdentity;
-    try {
-      delegationIdentity = await this.requestFEDelegation(tempIdentity);
-    } catch (error: unknown) {
-      if (error instanceof Error) {
-        return { kind: "authFail", error };
-      } else {
-        return {
-          kind: "authFail",
-          error: new Error("Unknown error when requesting delegation"),
-        };
-      }
-    }
+  }): Promise<
+    | RegistrationFlowStepSuccess
+    | ApiError
+    | InvalidCaller
+    | AlreadyInProgress
+    | RateLimitExceeded
+  > => {
+    const actor = await this.createActor(tempIdentity);
 
-    const actor = await this.createActor(delegationIdentity);
-    const pubkey = Array.from(new Uint8Array(identity.getPublicKey().toDer()));
-
-    let registerResponse: RegisterResponse;
+    let startResponse;
     try {
-      registerResponse = await actor.register(
-        {
-          alias,
-          pubkey,
-          credential_id: credentialId ? [credentialId] : [],
-          key_type: keyType,
-          purpose: { authentication: null },
-          protection: { unprotected: null },
-          origin: readDeviceOrigin(),
-          metadata: [],
-        },
-        challengeResult,
-        [tempIdentity.getPrincipal()]
-      );
+      startResponse = await actor.identity_registration_start();
     } catch (error: unknown) {
       if (error instanceof Error) {
         return { kind: "apiError", error };
@@ -184,11 +189,137 @@ export class Connection {
       }
     }
 
-    if ("canister_full" in registerResponse) {
-      return { kind: "registerNoSpace" };
-    } else if ("registered" in registerResponse) {
-      const userNumber = registerResponse.registered.user_number;
-      console.log(`registered Internet Identity ${userNumber}`);
+    if ("Ok" in startResponse) {
+      return {
+        kind: "registrationFlowStepSuccess",
+        nextStep: mapRegFlowNextStep(startResponse.Ok.next_step),
+      };
+    }
+
+    if ("Err" in startResponse) {
+      const err = startResponse.Err;
+      if ("InvalidCaller" in err) {
+        return { kind: "invalidCaller" };
+      }
+      if ("AlreadyInProgress" in err) {
+        return { kind: "alreadyInProgress" };
+      }
+      if ("RateLimitExceeded" in err) {
+        return { kind: "rateLimitExceeded" };
+      }
+    }
+    console.error(
+      "unexpected identity_registration_start response",
+      startResponse
+    );
+    throw Error("unexpected identity_registration_start response");
+  };
+
+  check_captcha = async ({
+    tempIdentity,
+    captchaSolution,
+  }: {
+    tempIdentity: SignIdentity;
+    captchaSolution: string;
+  }): Promise<
+    | RegistrationFlowStepSuccess
+    | ApiError
+    | NoRegistrationFlow
+    | UnexpectedCall
+    | WrongCaptchaSolution
+  > => {
+    const actor = await this.createActor(tempIdentity);
+
+    let captchaResponse;
+    try {
+      captchaResponse = await actor.check_captcha({
+        solution: captchaSolution,
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        return { kind: "apiError", error };
+      } else {
+        return {
+          kind: "apiError",
+          error: new Error("Unknown error when registering"),
+        };
+      }
+    }
+
+    if ("Ok" in captchaResponse) {
+      const nextStep = captchaResponse.Ok.next_step;
+      if ("Finish" in nextStep) {
+        return {
+          kind: "registrationFlowStepSuccess",
+          nextStep: { step: "finish" },
+        };
+      }
+      console.error(
+        "unexpected next step in check_captcha response",
+        captchaResponse
+      );
+      throw Error("unexpected next step in check_captcha response");
+    }
+
+    if ("Err" in captchaResponse) {
+      const err = captchaResponse.Err;
+      if ("WrongSolution" in err) {
+        return {
+          kind: "wrongCaptchaSolution",
+          new_captcha_png_base64: err.WrongSolution.new_captcha_png_base64,
+        };
+      }
+      if ("UnexpectedCall" in err) {
+        return {
+          kind: "unexpectedCall",
+          nextStep: mapRegFlowNextStep(err.UnexpectedCall.next_step),
+        };
+      }
+      if ("NoRegistrationFlow" in err) {
+        return { kind: "noRegistrationFlow" };
+      }
+    }
+    console.error("unexpected check_captcha response", captchaResponse);
+    throw Error("unexpected check_captcha response");
+  };
+
+  identity_registration_finish = async ({
+    tempIdentity,
+    identity,
+    authnMethod,
+  }: {
+    tempIdentity: SignIdentity;
+    identity: SignIdentity;
+    authnMethod: AuthnMethodData;
+  }): Promise<
+    | LoginSuccess
+    | ApiError
+    | NoRegistrationFlow
+    | UnexpectedCall
+    | RegisterNoSpace
+    | InvalidAuthnMethod
+  > => {
+    const delegationIdentity = await this.requestFEDelegation(tempIdentity);
+    const actor = await this.createActor(delegationIdentity);
+
+    let finishResponse;
+    try {
+      finishResponse = await actor.identity_registration_finish({
+        authn_method: authnMethod,
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        return { kind: "apiError", error };
+      } else {
+        return {
+          kind: "apiError",
+          error: new Error("Unknown error when registering"),
+        };
+      }
+    }
+
+    if ("Ok" in finishResponse) {
+      const userNumber = finishResponse.Ok.identity_number;
       return {
         kind: "loginSuccess",
         connection: new AuthenticatedConnection(
@@ -199,75 +330,136 @@ export class Connection {
           actor
         ),
         userNumber,
+        showAddCurrentDevice: false,
       };
-    } else if ("bad_challenge" in registerResponse) {
-      return { kind: "badChallenge" };
-    } else {
-      console.error("unexpected register response", registerResponse);
-      throw Error("unexpected register response");
     }
+
+    if ("Err" in finishResponse) {
+      const err = finishResponse.Err;
+      if ("InvalidAuthnMethod" in err) {
+        return {
+          kind: "invalidAuthnMethod",
+          message: err.InvalidAuthnMethod,
+        };
+      }
+      if ("UnexpectedCall" in err) {
+        return {
+          kind: "unexpectedCall",
+          nextStep: mapRegFlowNextStep(err.UnexpectedCall.next_step),
+        };
+      }
+      if ("NoRegistrationFlow" in err) {
+        return { kind: "noRegistrationFlow" };
+      }
+      if ("IdentityLimitReached" in err) {
+        return { kind: "registerNoSpace" };
+      }
+      if ("StorageError" in err) {
+        // this is unrecoverable, so we can just map it to a generic API error
+        return {
+          kind: "apiError",
+          error: new Error("StorageError: " + err.StorageError),
+        };
+      }
+    }
+    console.error("unexpected check_captcha response", finishResponse);
+    throw Error("unexpected check_captcha response");
   };
 
-  login = async (userNumber: bigint): Promise<LoginResult> => {
+  login = async (
+    userNumber: bigint
+  ): Promise<
+    | LoginSuccess
+    | AuthFail
+    | WebAuthnFailed
+    | PossiblyWrongRPID
+    | UnknownUser
+    | ApiError
+  > => {
     let devices: Omit<DeviceData, "alias">[];
     try {
       devices = await this.lookupAuthenticators(userNumber);
     } catch (e: unknown) {
-      if (e instanceof Error) {
-        return { kind: "apiError", error: e };
-      } else {
-        return {
-          kind: "apiError",
-          error: new Error("Unknown error when looking up authenticators"),
-        };
-      }
+      const errObj =
+        e instanceof Error
+          ? e
+          : new Error("Unknown error when looking up authenticators");
+      return { kind: "apiError", error: errObj };
     }
 
     if (devices.length === 0) {
       return { kind: "unknownUser", userNumber };
     }
 
+    if (HARDWARE_KEY_TEST.isEnabled()) {
+      devices = devices.filter(
+        (device) =>
+          Object.keys(device.key_type)[0] === "unknown" ||
+          Object.keys(device.key_type)[0] === "cross_platform"
+      );
+    }
+
     return this.fromWebauthnCredentials(
       userNumber,
-      devices.flatMap(({ credential_id, pubkey }) => {
-        return credential_id.length === 0
-          ? []
-          : [{ credential_id: credential_id[0], pubkey }];
-      })
+      devices.map(convertToValidCredentialData).filter(nonNullish)
     );
   };
 
   fromWebauthnCredentials = async (
     userNumber: bigint,
-    credentials: WebAuthnCredential[]
-  ): Promise<LoginResult> => {
+    credentials: CredentialData[]
+  ): Promise<LoginSuccess | WebAuthnFailed | PossiblyWrongRPID | AuthFail> => {
+    const cancelledRpIds = this._cancelledRpIds.get(userNumber) ?? new Set();
+    const currentOrigin = window.location.origin;
+    const dynamicRPIdEnabled =
+      DOMAIN_COMPATIBILITY.isEnabled() &&
+      supportsWebauthRoR(window.navigator.userAgent);
+    const filteredCredentials = excludeCredentialsFromOrigins(
+      credentials,
+      cancelledRpIds,
+      currentOrigin
+    );
+    const rpId = dynamicRPIdEnabled
+      ? findWebAuthnRpId(currentOrigin, filteredCredentials, relatedDomains())
+      : undefined;
+
     /* Recover the Identity (i.e. key pair) used when creating the anchor.
      * If the "DUMMY_AUTH" feature is set, we use a dummy identity, the same identity
      * that is used in the register flow.
      */
     const identity = features.DUMMY_AUTH
       ? new DummyIdentity()
-      : MultiWebAuthnIdentity.fromCredentials(
-          credentials.map(({ credential_id, pubkey }) => ({
-            pubkey: derFromPubkey(pubkey),
-            credentialId: Buffer.from(credential_id),
-          }))
-        );
+      : MultiWebAuthnIdentity.fromCredentials(filteredCredentials, rpId);
     let delegationIdentity: DelegationIdentity;
+
+    // Here we expect a webauth exception if the user canceled the webauthn prompt (triggered by
+    // "sign" inside the webauthn identity), and if so bubble it up
     try {
       delegationIdentity = await this.requestFEDelegation(identity);
     } catch (e: unknown) {
       if (isWebAuthnCancel(e)) {
+        // We only want to cache cancelled rpids if there can be multiple rpids.
+        if (
+          dynamicRPIdEnabled &&
+          hasCredentialsFromMultipleOrigins(credentials)
+        ) {
+          if (this._cancelledRpIds.has(userNumber)) {
+            this._cancelledRpIds.get(userNumber)?.add(rpId);
+          } else {
+            this._cancelledRpIds.set(userNumber, new Set([rpId]));
+          }
+          // We want to user to retry again and a new RP ID will be used.
+          return { kind: "possiblyWrongRPID" };
+        }
         return { kind: "webAuthnFailed" };
       }
-      if (e instanceof Error) {
-        return { kind: "authFail", error: e };
-      } else {
-        return {
-          kind: "authFail",
-          error: new Error("Unknown error when requesting delegation"),
-        };
-      }
+
+      throw new Error(
+        `Failed to authenticate using passkey: ${unknownToString(
+          e,
+          "unknown error"
+        )}, ${await diagnosticInfo()}`
+      );
     }
 
     const actor = await this.createActor(delegationIdentity);
@@ -284,6 +476,7 @@ export class Connection {
       kind: "loginSuccess",
       userNumber,
       connection,
+      showAddCurrentDevice: cancelledRpIds.size > 0,
     };
   };
   fromIdentity = async (
@@ -304,13 +497,14 @@ export class Connection {
       kind: "loginSuccess",
       userNumber,
       connection,
+      showAddCurrentDevice: false,
     };
   };
 
   fromSeedPhrase = async (
     userNumber: bigint,
     seedPhrase: string
-  ): Promise<LoginResult> => {
+  ): Promise<LoginSuccess | NoSeedPhrase | SeedPhraseFail> => {
     const pubkeys = (await this.lookupCredentials(userNumber)).recovery_phrases;
     if (pubkeys.length === 0) {
       return {
@@ -344,6 +538,7 @@ export class Connection {
         userNumber,
         actor
       ),
+      showAddCurrentDevice: false,
     };
   };
 
@@ -359,13 +554,6 @@ export class Connection {
   ): Promise<Omit<DeviceData, "alias">[]> => {
     const actor = await this.createActor();
     return await actor.lookup(userNumber);
-  };
-
-  createChallenge = async (): Promise<Challenge> => {
-    const actor = await this.createActor();
-    const challenge = await actor.create_challenge();
-    console.log("Challenge Created");
-    return challenge;
   };
 
   lookupAuthenticators = async (
@@ -400,22 +588,22 @@ export class Connection {
 
   // Create an actor representing the backend
   createActor = async (
-    delegationIdentity?: DelegationIdentity
+    identity?: SignIdentity
   ): Promise<ActorSubclass<_SERVICE>> => {
-    const agent = new HttpAgent({
-      identity: delegationIdentity,
+    if (this.overrideActor !== undefined) {
+      return this.overrideActor;
+    }
+    const agent = await HttpAgent.create({
+      identity,
       host: inferHost(),
+      // Only fetch the root key when we're not in prod
+      shouldFetchRootKey: features.FETCH_ROOT_KEY,
     });
 
-    // Only fetch the root key when we're not in prod
-    if (features.FETCH_ROOT_KEY) {
-      await agent.fetchRootKey();
-    }
-    const actor = Actor.createActor<_SERVICE>(internet_identity_idl, {
+    return Actor.createActor<_SERVICE>(internet_identity_idl, {
       agent,
       canisterId: this.canisterId,
     });
-    return actor;
   };
 
   requestFEDelegation = async (
@@ -437,6 +625,8 @@ export class Connection {
 }
 
 export class AuthenticatedConnection extends Connection {
+  private metadataRepository: IdentityMetadataRepository;
+
   public constructor(
     public canisterId: string,
     public identity: SignIdentity,
@@ -445,6 +635,24 @@ export class AuthenticatedConnection extends Connection {
     public actor?: ActorSubclass<_SERVICE>
   ) {
     super(canisterId);
+    const metadataGetter = async () => {
+      const response = await this.getIdentityInfo();
+      if ("Ok" in response) {
+        return response.Ok.metadata;
+      }
+      throw new Error("Error fetching metadata");
+    };
+    const metadataSetter = async (metadata: MetadataMapV2) => {
+      const response = await this.setIdentityMetadata(metadata);
+      if ("Ok" in response) {
+        return;
+      }
+      throw new Error("Error updating metadata");
+    };
+    this.metadataRepository = IdentityMetadataRepository.init({
+      getter: metadataGetter,
+      setter: metadataSetter,
+    });
   }
 
   async getActor(): Promise<ActorSubclass<_SERVICE>> {
@@ -466,9 +674,15 @@ export class AuthenticatedConnection extends Connection {
     return this.actor;
   }
 
-  getAnchorInfo = async (): Promise<IdentityAnchorInfo> => {
+  getAnchorInfo = async (): Promise<
+    IdentityAnchorInfo & { credentials: OpenIDCredential[] }
+  > => {
     const actor = await this.getActor();
-    return await actor.get_anchor_info(this.userNumber);
+    const anchorInfo = await actor.get_anchor_info(this.userNumber);
+    const mockedAnchorInfo = await this._mockOpenID.get_anchor_info(
+      this.userNumber
+    );
+    return { ...anchorInfo, ...mockedAnchorInfo };
   };
 
   getPrincipal = async ({
@@ -535,6 +749,32 @@ export class AuthenticatedConnection extends Connection {
   remove = async (publicKey: PublicKey): Promise<void> => {
     const actor = await this.getActor();
     await actor.remove(this.userNumber, publicKey);
+  };
+
+  private getIdentityInfo = async (): Promise<
+    { Ok: IdentityInfo } | { Err: IdentityInfoError }
+  > => {
+    const actor = await this.getActor();
+    return await actor.identity_info(this.userNumber);
+  };
+
+  private setIdentityMetadata = async (
+    metadata: MetadataMapV2
+  ): Promise<{ Ok: null } | { Err: IdentityMetadataReplaceError }> => {
+    const actor = await this.getActor();
+    return await actor.identity_metadata_replace(this.userNumber, metadata);
+  };
+
+  getIdentityMetadata = (): Promise<IdentityMetadata | undefined> => {
+    return this.metadataRepository.getMetadata();
+  };
+
+  updateIdentityMetadata = (partialMetadata: Partial<IdentityMetadata>) => {
+    return this.metadataRepository.updateMetadata(partialMetadata);
+  };
+
+  commitMetadata = async (): Promise<boolean> => {
+    return await this.metadataRepository.commitMetadata();
   };
 
   prepareDelegation = async (
@@ -684,6 +924,14 @@ export class AuthenticatedConnection extends Connection {
     console.error("Unknown error", err);
     return { error: "internal_error" };
   };
+
+  addJWT = async (jwt: JWT, salt: Salt): Promise<void> => {
+    await this._mockOpenID.add_jwt(this.userNumber, jwt, salt);
+  };
+
+  removeJWT = async (iss: string, sub: string): Promise<void> => {
+    await this._mockOpenID.remove_jwt(this.userNumber, iss, sub);
+  };
 }
 
 // Reads the "origin" used to infer what domain a FIDO device is available on.
@@ -733,7 +981,7 @@ export const creationOptions = (
             type: "public-key",
           }
     ),
-    challenge: Uint8Array.from("<ic0.app>", (c) => c.charCodeAt(0)),
+    challenge: window.crypto.getRandomValues(new Uint8Array(16)),
     pubKeyCredParams: [
       {
         type: "public-key",
@@ -750,7 +998,7 @@ export const creationOptions = (
       name: "Internet Identity Service",
     },
     user: {
-      id: tweetnacl.randomBytes(16),
+      id: window.crypto.getRandomValues(new Uint8Array(16)),
       name: "Internet Identity",
       displayName: "Internet Identity",
     },
@@ -823,4 +1071,17 @@ export const inferHost = (): string => {
 
   // Otherwise assume it's a custom setup and use the host itself as API.
   return location.protocol + "//" + location.host;
+};
+
+const mapRegFlowNextStep = (
+  step: RegistrationFlowNextStep
+): RegFlowNextStep => {
+  if ("Finish" in step) {
+    return { step: "finish" };
+  }
+  step satisfies { CheckCaptcha: { captcha_png_base64: string } };
+  return {
+    step: "checkCaptcha",
+    captcha_png_base64: step.CheckCaptcha.captcha_png_base64,
+  };
 };

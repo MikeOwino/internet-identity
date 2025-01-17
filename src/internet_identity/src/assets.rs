@@ -4,22 +4,30 @@
 use crate::http::security_headers;
 use crate::state;
 use asset_util::{collect_assets, Asset, CertifiedAssets, ContentEncoding, ContentType};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use ic_cdk::api;
 use include_dir::{include_dir, Dir};
+use serde_json::json;
+use sha2::Digest;
 
 // used both in init and post_upgrade
-pub fn init_assets() {
+pub fn init_assets(maybe_related_origins: Option<Vec<String>>) {
     state::assets_mut(|certified_assets| {
-        let assets = get_static_assets();
+        let assets = get_static_assets(maybe_related_origins);
 
-        // Extract the integrity hashes from all the HTML files
-        // i.e. go through the HTML and grab INTEGRITY from all the <script integrity="INTEGRITY">
+        // Extract integrity hashes for all inlined scripts, from all the HTML files.
         let integrity_hashes = assets
             .iter()
             .filter(|asset| asset.content_type == ContentType::HTML)
             .fold(vec![], |mut acc: Vec<String>, e| {
                 let content = std::str::from_utf8(&e.content).unwrap().to_string();
-                acc.append(&mut extract_integrity_hashes(content));
+                for inlined in extract_inline_scripts(content).iter() {
+                    let hash = sha2::Sha384::digest(inlined.as_bytes());
+                    let hash = BASE64.encode(hash);
+                    let hash = format!("sha384-{hash}");
+                    acc.push(hash);
+                }
                 acc
             });
 
@@ -31,61 +39,73 @@ pub fn init_assets() {
 // Fix up HTML pages, by injecting canister ID
 fn fixup_html(html: &str) -> String {
     let canister_id = api::id();
-    // XXX: to match, we rely on the fact that our bundle injects an 'integrity' attribute
-    // before all other attributes
     html.replace(
-        r#"<script integrity="#,
-        &format!(r#"<script data-canister-id="{canister_id}" integrity="#),
+        r#"<script "#,
+        &format!(r#"<script data-canister-id="{canister_id}" "#),
     )
 }
 
 static ASSET_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../dist");
 
 // Gets the static assets. All static assets are prepared only once (like injecting the canister ID).
-pub fn get_static_assets() -> Vec<Asset> {
+pub fn get_static_assets(maybe_related_origins: Option<Vec<String>>) -> Vec<Asset> {
     let mut assets = collect_assets(&ASSET_DIR, Some(fixup_html));
 
     // Required to make II available on the identity.internetcomputer.org domain.
     // See https://internetcomputer.org/docs/current/developer-docs/production/custom-domain/#custom-domains-on-the-boundary-nodes
     assets.push(Asset {
         url_path: "/.well-known/ic-domains".to_string(),
-        content: b"identity.internetcomputer.org".to_vec(),
+        content: b"identity.internetcomputer.org\nbeta.identity.ic0.app\nbeta.identity.internetcomputer.org".to_vec(),
         encoding: ContentEncoding::Identity,
         content_type: ContentType::OCTETSTREAM,
     });
+
+    if let Some(related_origins) = maybe_related_origins {
+        // Required to share passkeys with the different domains. Maximum of 5 labels.
+        // See https://web.dev/articles/webauthn-related-origin-requests#step_2_set_up_your_well-knownwebauthn_json_file_in_site-1
+        let content = json!({
+            "origins": related_origins,
+        })
+        .to_string()
+        .into_bytes();
+        assets.push(Asset {
+            url_path: "/.well-known/webauthn".to_string(),
+            content,
+            encoding: ContentEncoding::Identity,
+            content_type: ContentType::JSON,
+        });
+    }
     assets
 }
 
 /// Extract all integrity hashes from the given HTML
-fn extract_integrity_hashes(content: String) -> Vec<String> {
-    // Extract anything between 'integrity="' and '"'; simpler & more efficient
+fn extract_inline_scripts(content: String) -> Vec<String> {
+    // Extract content (C to D~ below) of <script> tags; simpler & more efficient
     // than parsing the HTML and works well enough
-    let hash_prefix = r#"integrity=""#;
-    let hash_suffix = r#"""#;
+    //
+    //  <script foo=bar>var foo = 42;</script>
+    //  ^              ^^            ^
+    //  A              BC            D
     content
-        .match_indices(hash_prefix)
-        .map(|(size, _)| {
-            let offset = size + hash_prefix.len();
-            let len = content[offset..].find(hash_suffix).unwrap();
-            content[offset..(offset + len)].to_string()
+        .match_indices("<script")
+        .map(|(tag_open_start /* A */, _)| {
+            let tag_open_len = content[tag_open_start..].find('>').unwrap(); /* B */
+            let inline_start /* C */ = tag_open_start + tag_open_len + 1;
+            let tag_close_start /* D */ = content[inline_start..].find("</script>").unwrap();
+            content[(inline_start)..(inline_start + tag_close_start)].to_string()
         })
         .collect()
 }
 
 #[test]
-fn test_extract_integrity_hashes() {
+fn test_extract_inline_scripts() {
     let expected: Vec<String> = vec![];
-    let actual = extract_integrity_hashes(r#"<head></head>"#.to_string());
+    let actual = extract_inline_scripts(r#"<head></head>"#.to_string());
     assert_eq!(expected, actual);
 
-    let expected: Vec<String> = vec!["hello-world".to_string()];
-    let actual =
-        extract_integrity_hashes(r#"<script integrity="hello-world"></script>"#.to_string());
-    assert_eq!(expected, actual);
-
-    let expected: Vec<String> = vec!["one".to_string(), "two".to_string()];
-    let actual = extract_integrity_hashes(
-        r#"<script integrity="one"></script><script foo=bar integrity="two" broken"#.to_string(),
+    let expected: Vec<String> = vec!["this is content".to_string()];
+    let actual = extract_inline_scripts(
+        r#"<script integrity="hello-world">this is content</script>"#.to_string(),
     );
     assert_eq!(expected, actual);
 }

@@ -1,36 +1,36 @@
 use crate::consent_message::{get_vc_consent_message, SupportedLanguage};
-use candid::{candid_method, CandidType, Deserialize, Principal};
-use canister_sig_util::signature_map::{SignatureMap, LABEL_SIG};
-use canister_sig_util::{extract_raw_root_pk_from_der, CanisterSigPublicKey, IC_ROOT_PK_DER};
+use candid::{CandidType, Deserialize, Principal};
+use ic_canister_sig_creation::signature_map::{CanisterSigInputs, SignatureMap, LABEL_SIG};
+use ic_canister_sig_creation::{
+    extract_raw_root_pk_from_der, CanisterSigPublicKey, IC_ROOT_PUBLIC_KEY,
+};
 use ic_cdk::api::{caller, set_certified_data, time};
 use ic_cdk_macros::{init, query, update};
 use ic_certification::{fork_hash, labeled_hash, pruned, Hash};
 use ic_stable_structures::storable::Bound;
 use ic_stable_structures::{DefaultMemoryImpl, RestrictedMemory, StableCell, Storable};
-use identity_core::common::{Timestamp, Url};
-use identity_core::convert::FromJson;
-use identity_credential::credential::{Credential, CredentialBuilder, Subject};
+use ic_verifiable_credentials::issuer_api::{
+    ArgumentValue, CredentialSpec, DerivationOriginData, DerivationOriginError,
+    DerivationOriginRequest, GetCredentialRequest, Icrc21ConsentInfo, Icrc21Error,
+    Icrc21VcConsentMessageRequest, IssueCredentialError, IssuedCredentialData,
+    PrepareCredentialRequest, PreparedCredentialData, SignedIdAlias,
+};
+use ic_verifiable_credentials::{
+    build_credential_jwt, did_for_principal, get_verified_id_alias_from_jws, vc_jwt_to_jws,
+    vc_signing_input, AliasTuple, CredentialParams, VC_SIGNING_INPUT_DOMAIN,
+};
 use include_dir::{include_dir, Dir};
 use serde_bytes::ByteBuf;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
-use vc_util::issuer_api::{
-    ArgumentValue, CredentialSpec, GetCredentialRequest, Icrc21ConsentInfo, Icrc21Error,
-    Icrc21ErrorInfo, Icrc21VcConsentMessageRequest, IssueCredentialError, IssuedCredentialData,
-    PrepareCredentialRequest, PreparedCredentialData, SignedIdAlias,
-};
-use vc_util::{
-    did_for_principal, get_verified_id_alias_from_jws, vc_jwt_to_jws, vc_signing_input,
-    vc_signing_input_hash, AliasTuple,
-};
 use SupportedCredentialType::{UniversityDegree, VerifiedAdult, VerifiedEmployee};
 
-use asset_util::{collect_assets, CertifiedAssets};
+use asset_util::{collect_assets, Asset, CertifiedAssets, ContentEncoding, ContentType};
 use ic_cdk::api;
 use ic_cdk_macros::post_upgrade;
+use lazy_static::lazy_static;
 
 mod consent_message;
 
@@ -65,6 +65,12 @@ thread_local! {
     static ASSETS: RefCell<CertifiedAssets> = RefCell::new(CertifiedAssets::default());
 }
 
+lazy_static! {
+    // Seed and public key used for signing the credentials.
+    static ref CANISTER_SIG_SEED: Vec<u8> = hash_bytes("vc_demo_issuer").to_vec();
+    static ref CANISTER_SIG_PK: CanisterSigPublicKey = CanisterSigPublicKey::new(ic_cdk::id(), CANISTER_SIG_SEED.clone());
+}
+
 /// Reserve the first stable memory page for the configuration stable cell.
 fn config_memory() -> Memory {
     RestrictedMemory::new(DefaultMemoryImpl::default(), 0..1)
@@ -73,12 +79,16 @@ fn config_memory() -> Memory {
 #[cfg(target_arch = "wasm32")]
 use ic_cdk::println;
 
-#[derive(CandidType, Deserialize)]
+#[derive(CandidType, Deserialize, Clone)]
 struct IssuerConfig {
     /// Root of trust for checking canister signatures.
     ic_root_key_raw: Vec<u8>,
     /// List of canister ids that are allowed to provide id alias credentials.
     idp_canister_ids: Vec<Principal>,
+    /// The derivation origin to be used by the issuer.
+    derivation_origin: String,
+    /// Frontend hostname to be used by the issuer.
+    frontend_hostname: String,
 }
 
 impl Storable for IssuerConfig {
@@ -93,10 +103,12 @@ impl Storable for IssuerConfig {
 
 impl Default for IssuerConfig {
     fn default() -> Self {
+        let derivation_origin = format!("https://{}.icp0.io", ic_cdk::id().to_text());
         Self {
-            ic_root_key_raw: extract_raw_root_pk_from_der(IC_ROOT_PK_DER)
-                .expect("failed to extract raw root pk from der"),
+            ic_root_key_raw: IC_ROOT_PUBLIC_KEY.clone(),
             idp_canister_ids: vec![Principal::from_text(PROD_II_CANISTER_ID).unwrap()],
+            derivation_origin: derivation_origin.clone(),
+            frontend_hostname: derivation_origin, // by default, use DERIVATION_ORIGIN as frontend-hostname
         }
     }
 }
@@ -104,9 +116,15 @@ impl Default for IssuerConfig {
 impl From<IssuerInit> for IssuerConfig {
     fn from(init: IssuerInit) -> Self {
         Self {
-            ic_root_key_raw: extract_raw_root_pk_from_der(&init.ic_root_key_der)
-                .expect("failed to extract raw root pk from der"),
+            ic_root_key_raw: if let Some(custom_root_pk) = init.ic_root_key_der {
+                extract_raw_root_pk_from_der(&custom_root_pk)
+                    .expect("failed to extract raw root pk from der")
+            } else {
+                IC_ROOT_PUBLIC_KEY.clone()
+            },
             idp_canister_ids: init.idp_canister_ids,
+            derivation_origin: init.derivation_origin,
+            frontend_hostname: init.frontend_hostname,
         }
     }
 }
@@ -114,16 +132,19 @@ impl From<IssuerInit> for IssuerConfig {
 #[derive(CandidType, Deserialize)]
 struct IssuerInit {
     /// Root of trust for checking canister signatures.
-    ic_root_key_der: Vec<u8>,
+    ic_root_key_der: Option<Vec<u8>>,
     /// List of canister ids that are allowed to provide id alias credentials.
     idp_canister_ids: Vec<Principal>,
+    /// The derivation origin to be used by the issuer.
+    derivation_origin: String,
+    /// Frontend hostname be used by the issuer.
+    frontend_hostname: String,
 }
 
 #[init]
-#[candid_method(init)]
 fn init(init_arg: Option<IssuerInit>) {
     if let Some(init) = init_arg {
-        apply_config(init);
+        apply_config(IssuerConfig::from(init));
     };
 
     init_assets();
@@ -135,14 +156,21 @@ fn post_upgrade(init_arg: Option<IssuerInit>) {
 }
 
 #[update]
-#[candid_method]
-fn configure(config: IssuerInit) {
+fn configure(init: IssuerInit) {
+    apply_config(IssuerConfig::from(init));
+}
+
+#[update]
+fn set_derivation_origin(frontend_hostname: String, derivation_origin: String) {
+    let mut config: IssuerConfig = CONFIG.with_borrow(|config| config.get().clone());
+    config.derivation_origin = derivation_origin;
+    config.frontend_hostname = frontend_hostname;
     apply_config(config);
 }
 
-fn apply_config(init: IssuerInit) {
+fn apply_config(config: IssuerConfig) {
     CONFIG
-        .with_borrow_mut(|config_cell| config_cell.set(IssuerConfig::from(init)))
+        .with_borrow_mut(|config_cell| config_cell.set(config))
         .expect("failed to apply issuer config");
 }
 
@@ -172,7 +200,6 @@ fn authorize_vc_request(
 }
 
 #[update]
-#[candid_method]
 async fn prepare_credential(
     req: PrepareCredentialRequest,
 ) -> Result<PreparedCredentialData, IssueCredentialError> {
@@ -180,30 +207,21 @@ async fn prepare_credential(
         Ok(alias_tuple) => alias_tuple,
         Err(err) => return Err(err),
     };
-    let credential_type = match verify_credential_spec(&req.credential_spec) {
-        Ok(credential_type) => credential_type,
-        Err(err) => {
-            return Err(IssueCredentialError::UnsupportedCredentialSpec(err));
-        }
-    };
 
-    let credential = match prepare_credential_payload(&credential_type, &alias_tuple) {
+    let credential_jwt = match prepare_credential_jwt(&req.credential_spec, &alias_tuple) {
         Ok(credential) => credential,
         Err(err) => return Result::<PreparedCredentialData, IssueCredentialError>::Err(err),
     };
-    let seed = calculate_seed(&alias_tuple.id_alias);
-    let canister_id = ic_cdk::id();
-    let canister_sig_pk = CanisterSigPublicKey::new(canister_id, seed.to_vec());
-    let credential_jwt = credential
-        .serialize_jwt()
-        .expect("internal: JWT serialization failure");
     let signing_input =
-        vc_signing_input(&credential_jwt, &canister_sig_pk).expect("failed getting signing_input");
-    let msg_hash = vc_signing_input_hash(&signing_input);
+        vc_signing_input(&credential_jwt, &CANISTER_SIG_PK).expect("failed getting signing_input");
 
     SIGNATURES.with(|sigs| {
         let mut sigs = sigs.borrow_mut();
-        sigs.add_signature(seed.as_ref(), msg_hash);
+        sigs.add_signature(&CanisterSigInputs {
+            domain: VC_SIGNING_INPUT_DOMAIN,
+            seed: &CANISTER_SIG_SEED,
+            message: &signing_input,
+        });
     });
     update_root_hash();
     Ok(PreparedCredentialData {
@@ -226,21 +244,15 @@ fn update_root_hash() {
 }
 
 #[query]
-#[candid_method(query)]
 fn get_credential(req: GetCredentialRequest) -> Result<IssuedCredentialData, IssueCredentialError> {
-    let alias_tuple = match authorize_vc_request(&req.signed_id_alias, &caller(), time().into()) {
-        Ok(alias_tuple) => alias_tuple,
-        Err(err) => return Result::<IssuedCredentialData, IssueCredentialError>::Err(err),
+    if let Err(err) = authorize_vc_request(&req.signed_id_alias, &caller(), time().into()) {
+        return Result::<IssuedCredentialData, IssueCredentialError>::Err(err);
     };
     if let Err(err) = verify_credential_spec(&req.credential_spec) {
         return Result::<IssuedCredentialData, IssueCredentialError>::Err(
             IssueCredentialError::UnsupportedCredentialSpec(err),
         );
     }
-    let subject_principal = alias_tuple.id_alias;
-    let seed = calculate_seed(&subject_principal);
-    let canister_id = ic_cdk::id();
-    let canister_sig_pk = CanisterSigPublicKey::new(canister_id, seed.to_vec());
     let prepared_context = match req.prepared_context {
         Some(context) => context,
         None => {
@@ -258,12 +270,18 @@ fn get_credential(req: GetCredentialRequest) -> Result<IssuedCredentialData, Iss
         }
     };
     let signing_input =
-        vc_signing_input(&credential_jwt, &canister_sig_pk).expect("failed getting signing_input");
-    let message_hash = vc_signing_input_hash(&signing_input);
+        vc_signing_input(&credential_jwt, &CANISTER_SIG_PK).expect("failed getting signing_input");
     let sig_result = SIGNATURES.with(|sigs| {
         let sig_map = sigs.borrow();
         let certified_assets_root_hash = ASSETS.with_borrow(|assets| assets.root_hash());
-        sig_map.get_signature_as_cbor(&seed, message_hash, Some(certified_assets_root_hash))
+        sig_map.get_signature_as_cbor(
+            &CanisterSigInputs {
+                domain: VC_SIGNING_INPUT_DOMAIN,
+                seed: &CANISTER_SIG_SEED,
+                message: &signing_input,
+            },
+            Some(certified_assets_root_hash),
+        )
     });
     let sig = match sig_result {
         Ok(sig) => sig,
@@ -277,24 +295,41 @@ fn get_credential(req: GetCredentialRequest) -> Result<IssuedCredentialData, Iss
         }
     };
     let vc_jws =
-        vc_jwt_to_jws(&credential_jwt, &canister_sig_pk, &sig).expect("failed constructing JWS");
+        vc_jwt_to_jws(&credential_jwt, &CANISTER_SIG_PK, &sig).expect("failed constructing JWS");
     Result::<IssuedCredentialData, IssueCredentialError>::Ok(IssuedCredentialData { vc_jws })
 }
 
 #[update]
-#[candid_method]
 async fn vc_consent_message(
     req: Icrc21VcConsentMessageRequest,
 ) -> Result<Icrc21ConsentInfo, Icrc21Error> {
-    let credential_type = match verify_credential_spec(&req.credential_spec) {
-        Ok(credential_type) => credential_type,
-        Err(err) => {
-            return Err(Icrc21Error::UnsupportedCanisterCall(Icrc21ErrorInfo {
-                description: err,
-            }));
+    get_vc_consent_message(
+        &req.credential_spec,
+        &SupportedLanguage::from(req.preferences),
+    )
+}
+
+#[update]
+async fn derivation_origin(
+    req: DerivationOriginRequest,
+) -> Result<DerivationOriginData, DerivationOriginError> {
+    get_derivation_origin(&req.frontend_hostname)
+}
+
+fn get_derivation_origin(hostname: &str) -> Result<DerivationOriginData, DerivationOriginError> {
+    CONFIG.with_borrow(|config| {
+        let config = config.get();
+
+        // We don't currently rely on the value provided, so if it doesn't match
+        // we just print a warning
+        if hostname != config.frontend_hostname {
+            println!("*** achtung! bad frontend hostname {}", hostname,);
         }
-    };
-    get_vc_consent_message(&credential_type, &SupportedLanguage::from(req.preferences))
+
+        Ok(DerivationOriginData {
+            origin: config.derivation_origin.clone(),
+        })
+    })
 }
 
 fn verify_credential_spec(spec: &CredentialSpec) -> Result<SupportedCredentialType, String> {
@@ -316,7 +351,7 @@ fn verify_credential_spec(spec: &CredentialSpec) -> Result<SupportedCredentialTy
             Ok(UniversityDegree(VC_INSTITUTION_NAME.to_string()))
         }
         "VerifiedAdult" => {
-            verify_single_argument(spec, "age_at_least", ArgumentValue::Int(18))?;
+            verify_single_argument(spec, "minAge", ArgumentValue::Int(18))?;
             Ok(VerifiedAdult(18))
         }
         other => Err(format!("Credential {} is not supported", other)),
@@ -368,28 +403,24 @@ fn verify_single_argument(
 }
 
 #[update]
-#[candid_method]
 fn add_employee(employee_id: Principal) -> String {
     EMPLOYEES.with_borrow_mut(|employees| employees.insert(employee_id));
     format!("Added employee {}", employee_id)
 }
 
 #[update]
-#[candid_method]
 fn add_graduate(graduate_id: Principal) -> String {
     GRADUATES.with_borrow_mut(|graduates| graduates.insert(graduate_id));
     format!("Added graduate {}", graduate_id)
 }
 
 #[update]
-#[candid_method]
 fn add_adult(adult_id: Principal) -> String {
     ADULTS.with_borrow_mut(|adults| adults.insert(adult_id));
     format!("Added adult {}", adult_id)
 }
 
 #[query]
-#[candid_method(query)]
 pub fn http_request(req: HttpRequest) -> HttpResponse {
     let parts: Vec<&str> = req.url.split('?').collect();
     let path = parts[0];
@@ -417,129 +448,116 @@ pub fn http_request(req: HttpRequest) -> HttpResponse {
     }
 }
 
-fn static_headers() -> Vec<(String, String)> {
+fn static_headers() -> Vec<HeaderField> {
     vec![("Access-Control-Allow-Origin".to_string(), "*".to_string())]
+}
+
+#[update]
+fn set_alternative_origins(alternative_origins: String) {
+    const ALTERNATIVE_ORIGINS_PATH: &str = "/.well-known/ii-alternative-origins";
+    ASSETS.with_borrow_mut(|assets| {
+        let asset = Asset {
+            url_path: ALTERNATIVE_ORIGINS_PATH.to_string(),
+            content: alternative_origins.as_bytes().to_vec(),
+            encoding: ContentEncoding::Identity,
+            content_type: ContentType::JSON,
+        };
+        assets.certify_asset(asset, &static_headers())
+    });
+    update_root_hash()
 }
 
 fn main() {}
 
-fn calculate_seed(principal: &Principal) -> Hash {
-    // IMPORTANT: In a real dapp the salt should be set to a random value.
-    let dummy_salt = [5u8; 32];
-
-    let mut bytes: Vec<u8> = vec![];
-    bytes.push(dummy_salt.len() as u8);
-    bytes.extend_from_slice(&dummy_salt);
-
-    let principal_bytes = principal.as_slice();
-    bytes.push(principal_bytes.len() as u8);
-    bytes.extend(principal_bytes);
-    hash_bytes(bytes)
+fn bachelor_degree_credential(
+    subject_principal: Principal,
+    credential_spec: &CredentialSpec,
+) -> String {
+    let params = CredentialParams {
+        spec: credential_spec.clone(),
+        subject_id: did_for_principal(subject_principal),
+        credential_id_url: "https://example.edu/credentials/3732".to_string(),
+        issuer_url: "https://example.edu".to_string(),
+        expiration_timestamp_s: exp_timestamp_s(),
+    };
+    build_credential_jwt(params)
 }
 
-fn bachelor_degree_credential(subject_principal: Principal, institution_name: &str) -> Credential {
-    let subject: Subject = Subject::from_json_value(json!({
-      "id": did_for_principal(subject_principal),
-      "degree": {
-        "type": "BachelorDegree",
-        "name": "Bachelor of Engineering",
-        "institutionName": institution_name,
-      },
-    }))
-    .unwrap();
-
-    // Build credential using subject above and issuer.
-    CredentialBuilder::default()
-        .id(Url::parse("https://example.edu/credentials/3732").unwrap())
-        .issuer(Url::parse("https://example.edu").unwrap())
-        .type_("UniversityDegreeCredential")
-        .subject(subject)
-        .expiration_date(exp_timestamp())
-        .build()
-        .unwrap()
+fn dfinity_employment_credential(
+    subject_principal: Principal,
+    credential_spec: &CredentialSpec,
+) -> String {
+    let params = CredentialParams {
+        spec: credential_spec.clone(),
+        subject_id: did_for_principal(subject_principal),
+        credential_id_url: "https://employment.info/credentials/42".to_string(),
+        issuer_url: "https://employment.info".to_string(),
+        expiration_timestamp_s: exp_timestamp_s(),
+    };
+    build_credential_jwt(params)
 }
 
-fn dfinity_employment_credential(subject_principal: Principal, employer_name: &str) -> Credential {
-    let subject: Subject = Subject::from_json_value(json!({
-      "id": did_for_principal(subject_principal),
-      "employee_of": {
-            "employerId" : "did:web:dfinity.org",
-            "employerName": employer_name,
-      },
-    }))
-    .unwrap();
-
-    // Build credential using subject above and issuer.
-    CredentialBuilder::default()
-        .id(Url::parse("https://employment.info/credentials/42").unwrap())
-        .issuer(Url::parse("https://employment.info").unwrap())
-        .type_("VerifiedEmployee")
-        .subject(subject)
-        .expiration_date(exp_timestamp())
-        .build()
-        .unwrap()
+fn verified_adult_credential(
+    subject_principal: Principal,
+    credential_spec: &CredentialSpec,
+) -> String {
+    let params = CredentialParams {
+        spec: credential_spec.clone(),
+        subject_id: did_for_principal(subject_principal),
+        credential_id_url: "https://age_verifier.info/credentials/42".to_string(),
+        issuer_url: "https://age_verifier.info".to_string(),
+        expiration_timestamp_s: exp_timestamp_s(),
+    };
+    build_credential_jwt(params)
 }
 
-fn verified_adult_credential(subject_principal: Principal, age_at_least: u16) -> Credential {
-    let subject: Subject = Subject::from_json_value(json!({
-      "id": did_for_principal(subject_principal),
-      "age_at_least": age_at_least,
-    }))
-    .unwrap();
-
-    // Build credential using subject above and issuer.
-    CredentialBuilder::default()
-        .id(Url::parse("https://age_verifier.info/credentials/42").unwrap())
-        .issuer(Url::parse("https://age_verifier.info").unwrap())
-        .type_("VerifiedAdult")
-        .subject(subject)
-        .expiration_date(exp_timestamp())
-        .build()
-        .unwrap()
+fn exp_timestamp_s() -> u32 {
+    ((time() + VC_EXPIRATION_PERIOD_NS) / 1_000_000_000) as u32
 }
 
-fn exp_timestamp() -> Timestamp {
-    Timestamp::from_unix(((time() + VC_EXPIRATION_PERIOD_NS) / 1_000_000_000) as i64)
-        .expect("internal: failed computing expiration timestamp")
-}
-
-fn prepare_credential_payload(
-    credential_type: &SupportedCredentialType,
+fn prepare_credential_jwt(
+    credential_spec: &CredentialSpec,
     alias_tuple: &AliasTuple,
-) -> Result<Credential, IssueCredentialError> {
+) -> Result<String, IssueCredentialError> {
+    let credential_type = match verify_credential_spec(credential_spec) {
+        Ok(credential_type) => credential_type,
+        Err(err) => {
+            return Err(IssueCredentialError::UnsupportedCredentialSpec(err));
+        }
+    };
     match credential_type {
-        VerifiedEmployee(employer_name) => {
+        VerifiedEmployee(_) => {
             EMPLOYEES.with_borrow(|employees| {
                 verify_authorized_principal(credential_type, alias_tuple, employees)
             })?;
             Ok(dfinity_employment_credential(
                 alias_tuple.id_alias,
-                employer_name.as_str(),
+                credential_spec,
             ))
         }
-        UniversityDegree(institution_name) => {
+        UniversityDegree(_) => {
             GRADUATES.with_borrow(|graduates| {
                 verify_authorized_principal(credential_type, alias_tuple, graduates)
             })?;
             Ok(bachelor_degree_credential(
                 alias_tuple.id_alias,
-                institution_name.as_str(),
+                credential_spec,
             ))
         }
-        VerifiedAdult(age_at_least) => {
+        VerifiedAdult(_) => {
             ADULTS.with_borrow(|adults| {
                 verify_authorized_principal(credential_type, alias_tuple, adults)
             })?;
             Ok(verified_adult_credential(
                 alias_tuple.id_alias,
-                *age_at_least,
+                credential_spec,
             ))
         }
     }
 }
 
 fn verify_authorized_principal(
-    credential_type: &SupportedCredentialType,
+    credential_type: SupportedCredentialType,
     alias_tuple: &AliasTuple,
     authorized_principals: &HashSet<Principal>,
 ) -> Result<(), IssueCredentialError> {
@@ -568,7 +586,7 @@ fn hash_bytes(value: impl AsRef<[u8]>) -> Hash {
     hasher.finalize().into()
 }
 
-// Order dependent: do not move above any function annotated with #[candid_method]!
+// Order dependent: do not move above any exposed canister method!
 candid::export_service!();
 
 // Assets
@@ -628,8 +646,9 @@ mod test {
         )
         .unwrap_or_else(|e| {
             panic!(
-                "the canister code interface is not equal to the did file: {:?}",
-                e
+                "the canister interface is not equal to the did file: {:?} \n--- current interface:\n{}\n",
+                e,
+                canister_interface,
             )
         });
     }

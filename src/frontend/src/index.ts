@@ -1,8 +1,5 @@
-import {
-  handleLogin,
-  handleLoginFlowResult,
-} from "$src/components/authenticateBox";
-import { addDeviceSuccess } from "$src/flows/addDevice/manage/addDeviceSuccess";
+import { handleLoginFlowResult } from "$src/components/authenticateBox";
+import { callbackFlow, REDIRECT_CALLBACK_PATH } from "$src/flows/redirect";
 import { nonNullish } from "@dfinity/utils";
 import { registerTentativeDevice } from "./flows/addDevice/welcomeView/registerTentativeDevice";
 import { authFlowAuthorize } from "./flows/authorize";
@@ -16,20 +13,20 @@ void createSpa(async (connection) => {
   if (nonNullish(addDeviceAnchor)) {
     const userNumber = addDeviceAnchor;
     // Register this device (tentatively)
-    const { alias: deviceAlias } = await registerTentativeDevice(
+    const registerDeviceResult = await registerTentativeDevice(
       addDeviceAnchor,
       connection
     );
-
-    // Display a success page once device added (above registerTentativeDevice **never** returns if it fails)
-    await addDeviceSuccess({ deviceAlias });
+    if (registerDeviceResult.tag === "canceled") {
+      // Adding a device was canceled, fall back into default flow
+      return authFlowManage(connection);
+    }
+    registerDeviceResult satisfies { tag: "deviceAdded" };
 
     const renderManage = renderManageWarmup();
 
     // If user "Click" continue in success page, proceed with authentication
-    const result = await handleLogin({
-      login: () => connection.login(userNumber),
-    });
+    const result = await connection.login(userNumber);
     const loginData = await handleLoginFlowResult(result);
 
     // User have successfully signed-in we can jump to manage page
@@ -47,6 +44,9 @@ void createSpa(async (connection) => {
   if (url.hash === "#authorize") {
     // User was brought here by a dapp for authorization
     return authFlowAuthorize(connection);
+  } else if (url.pathname === REDIRECT_CALLBACK_PATH) {
+    // User was returned here after redirect from a OpenID flow callback
+    return callbackFlow();
   } else {
     // The default flow
     return authFlowManage(connection);

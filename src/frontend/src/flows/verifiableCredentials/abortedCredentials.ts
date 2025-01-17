@@ -12,6 +12,8 @@ export type AbortReason =
   | "internal_error"
   | "auth_failed_ii"
   | "auth_failed_issuer"
+  | "derivation_origin_issuer_error"
+  | "invalid_derivation_origin_issuer"
   | "issuer_api_error"
   | "bad_principal_rp"
   | "no_canister_id"
@@ -50,8 +52,6 @@ const abortedCredentialsTemplate = ({
       <h1 class="t-title t-title--main">${copy.title}</h1>
     </hgroup>
     <p class="t-paragraph">${copy[`aborted_${reason}`]}</p>
-
-    <p class="t-paragraph">${copy.notice}</p>
 
     <button
       data-action="cancel"

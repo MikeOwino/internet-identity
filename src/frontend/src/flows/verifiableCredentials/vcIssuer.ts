@@ -12,29 +12,27 @@ import {
 } from "@dfinity/internet-identity-vc-api";
 
 import { inferHost } from "$src/utils/iiConnection";
+import { Principal } from "@dfinity/principal";
 
 // Boilerplate for contacting a canister implementing the Issuer API
 export class VcIssuer {
-  public constructor(readonly canisterId: string) {}
+  public constructor(readonly canisterId: Principal) {}
 
   // Create an actor representing the backend
   createActor = async (
     identity?: Identity
   ): Promise<ActorSubclass<_SERVICE>> => {
-    const agent = new HttpAgent({
+    const agent = await HttpAgent.create({
       host: inferHost(),
       identity,
+      // Only fetch the root key when we're not in prod
+      shouldFetchRootKey: features.FETCH_ROOT_KEY,
     });
 
-    // Only fetch the root key when we're not in prod
-    if (features.FETCH_ROOT_KEY) {
-      await agent.fetchRootKey();
-    }
-    const actor = Actor.createActor<_SERVICE>(vc_issuer_idl, {
+    return Actor.createActor<_SERVICE>(vc_issuer_idl, {
       agent,
       canisterId: this.canisterId,
     });
-    return actor;
   };
 
   prepareCredential = async ({
@@ -54,7 +52,9 @@ export class VcIssuer {
     });
 
     if ("Err" in result) {
-      console.error("Could not prepare credential", result.Err);
+      console.error(
+        "Could not prepare credential: " + JSON.stringify(result.Err)
+      );
       return "error";
     }
 
@@ -106,5 +106,33 @@ export class VcIssuer {
     }
 
     return result.Ok;
+  };
+
+  getDerivationOrigin = async ({
+    origin,
+  }: {
+    origin: string;
+  }): Promise<{ kind: "origin"; origin: string } | { kind: "error" }> => {
+    const actor = await this.createActor();
+
+    let result;
+    try {
+      result = await actor.derivation_origin({
+        frontend_hostname: origin,
+      });
+    } catch (e: unknown) {
+      console.error("Could not get derivation origin (unexpected error)", e);
+      return { kind: "error" };
+    }
+
+    if ("Err" in result) {
+      console.error(
+        "Could not get derivation origin (issuer error)",
+        JSON.stringify(result.Err)
+      );
+      return { kind: "error" };
+    }
+
+    return { kind: "origin", origin: result.Ok.origin };
   };
 }

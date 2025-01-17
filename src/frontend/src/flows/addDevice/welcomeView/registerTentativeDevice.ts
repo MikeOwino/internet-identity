@@ -5,6 +5,9 @@ import {
 } from "$generated/internet_identity_types";
 import { displayError } from "$src/components/displayError";
 import { withLoader } from "$src/components/loader";
+import { addDeviceSuccess } from "$src/flows/addDevice/addDeviceSuccess";
+import { tentativeDeviceStepper } from "$src/flows/addDevice/stepper";
+import { promptDeviceTrusted } from "$src/flows/addDevice/welcomeView/promptDeviceTrusted";
 import { inferPasskeyAlias, loadUAParser } from "$src/flows/register";
 import { setAnchorUsed } from "$src/storage";
 import { authenticatorAttachmentToKeyType } from "$src/utils/authenticatorAttachment";
@@ -21,15 +24,31 @@ import { deviceRegistrationDisabledInfo } from "./deviceRegistrationModeDisabled
 import { showVerificationCode } from "./showVerificationCode";
 
 /**
- * Prompts the user to enter a device alias. When clicking next, the device is added tentatively to the given identity anchor.
+ * Runs the tentative device registration flow on a _new_ device:
+ *  1. The user is prompted to confirm this device is trusted.
+ *  2. The user interacts with the authenticator to create a new credential.
+ *  3. After adding it tentatively, the user is prompted to enter the verification
+ *     code on an existing device.
+ *  4. This flows polls for the user to complete the verification.
+ *  5. Once verification is completed, a success screen is shown.
+ *
+ *  If the user cancels at any point, the flow is aborted.
+ *
  * @param userNumber anchor to add the tentative device to.
+ * @param connection connection to interact with the II canister.
  */
 export const registerTentativeDevice = async (
   userNumber: bigint,
   connection: Connection
-): Promise<{ alias: string }> => {
+): Promise<{ tag: "deviceAdded" } | { tag: "canceled" }> => {
   // Kick-off fetching "ua-parser-js";
   const uaParser = loadUAParser();
+
+  const deviceTrusted = await promptDeviceTrusted({ userNumber });
+  if (deviceTrusted === "canceled") {
+    return { tag: "canceled" };
+  }
+  deviceTrusted satisfies "confirmed";
 
   // Then, we create local WebAuthn credentials for the device
   const result = await withLoader(() =>
@@ -52,8 +71,7 @@ export const registerTentativeDevice = async (
         primaryButton: "Ok",
       });
     }
-    // TODO L2-309: do this without reload
-    return window.location.reload() as never;
+    return { tag: "canceled" };
   }
 
   const alias = await inferPasskeyAlias({
@@ -81,17 +99,33 @@ export const registerTentativeDevice = async (
     device,
   });
 
+  if ("tag" in addResponse) {
+    addResponse satisfies { tag: "canceled" };
+    return addResponse;
+  }
+
   // If everything went well we can now ask the user to authenticate on an existing device
   // and enter a verification code
-  (await showVerificationCode(
+  const verificationCodeResult = await showVerificationCode(
     userNumber,
     connection,
     device.alias,
     addResponse.added_tentatively,
     device.credential_id[0]
-  )) satisfies "ok";
+  );
 
-  return { alias };
+  if (verificationCodeResult === "canceled") {
+    return { tag: "canceled" };
+  }
+
+  verificationCodeResult satisfies "ok";
+
+  await addDeviceSuccess({
+    userNumber,
+    deviceAlias: alias,
+    stepper: tentativeDeviceStepper({ step: "success" }),
+  });
+  return { tag: "deviceAdded" };
 };
 
 /** Create new WebAuthn credentials */
@@ -132,7 +166,7 @@ export const addTentativeDevice = async ({
   userNumber: bigint;
   connection: Connection;
   device: Omit<DeviceData, "origin">;
-}): Promise<AddDeviceSuccess> => {
+}): Promise<AddDeviceSuccess | { tag: "canceled" }> => {
   // Try to add the device tentatively, retrying if necessary
   for (;;) {
     const result = await withLoader(() =>
@@ -147,16 +181,14 @@ export const addTentativeDevice = async ({
           'The "add device" process was already started for another device. If you want to add this device instead, log in using an existing device and restart the "add device" process.',
         primaryButton: "Ok",
       });
-      // TODO L2-309: do this without reload
-      return window.location.reload() as never;
+      return { tag: "canceled" };
     }
 
     if ("device_registration_mode_off" in result) {
       // User hasn't started the "add device" flow, so we offer to enable it and retry, or cancel
       const res = await deviceRegistrationDisabledInfo(userNumber);
       if (res === "canceled") {
-        // TODO L2-309: do this without reload
-        return window.location.reload() as never;
+        return { tag: "canceled" };
       }
 
       if (res === "retry") {

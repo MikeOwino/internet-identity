@@ -1,22 +1,51 @@
+import { ERROR_SUPPORT_URL } from "$src/config";
 import { html, render } from "lit-html";
-import loaderUrl from "./loader.svg";
 
-const loader = () => html` <div id="loader" class="c-loader">
-  <img class="c-loader__image" src=${loaderUrl} alt="loading" />
-</div>`;
+// Use same import approach as in 'src/frontend/src/flows/dappsExplorer/dapps.ts'
+// this makes the import the same format (url string) in both the build and showcase.
+const loaderUrl = import.meta.glob("./loader.svg", {
+  eager: true,
+  query: "?url",
+  import: "default",
+})["./loader.svg"] as string;
 
-const startLoader = () => {
+// Duration in milliseconds a user considers as taking forever
+const TAKING_FOREVER = 10000;
+
+const loader = (takingForever = false) =>
+  html` <div id="loader" class="c-loader">
+    <img class="c-loader__image" src="${loaderUrl}" alt="loading" />
+    ${takingForever
+      ? html`<a
+          href="${ERROR_SUPPORT_URL}"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="c-loader__link"
+          >Check ongoing issues</a
+        >`
+      : ""}
+  </div>`;
+
+const startLoader = (showCheckOngoingIssues?: boolean) => {
   const container = document.getElementById("loaderContainer") as HTMLElement;
-  render(loader(), container);
+  render(loader(showCheckOngoingIssues), container);
+
+  const takingForeverTimeout = setTimeout(
+    () => render(loader(true), container),
+    TAKING_FOREVER
+  );
+
+  return () => {
+    clearTimeout(takingForeverTimeout);
+    render(html``, container);
+  };
 };
 
-const endLoader = () => {
-  const container = document.getElementById("loaderContainer") as HTMLElement;
-  render(html``, container);
-};
-
-export const withLoader = async <A>(action: () => Promise<A>): Promise<A> => {
-  startLoader();
+export const withLoader = async <A>(
+  action: () => Promise<A>,
+  showCheckOngoingIssues?: boolean
+): Promise<A> => {
+  const endLoader = startLoader(showCheckOngoingIssues);
   try {
     return await action();
   } finally {

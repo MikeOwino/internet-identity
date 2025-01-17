@@ -1,12 +1,12 @@
 use canister_tests::api::archive as api;
 use canister_tests::framework::*;
-use ic_test_state_machine_client::CallError;
-use ic_test_state_machine_client::ErrorCode::CanisterCalledTrap;
 use internet_identity_interface::archive::types::*;
 use internet_identity_interface::internet_identity::types::*;
+use pocket_ic::CallError;
+use pocket_ic::ErrorCode::CanisterCalledTrap;
 use regex::Regex;
 use serde_bytes::ByteBuf;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// Verifies that the canister can be installed successfully.
 #[test]
@@ -469,7 +469,7 @@ mod read_tests {
             error_buffer_limit: 1,
         })
         .unwrap();
-        let canister_id = env.create_canister(None);
+        let canister_id = env.create_canister();
         env.install_canister(canister_id, ARCHIVE_WASM.clone(), config, None);
 
         // 257 entries because we need the index to not fit in a single byte
@@ -521,6 +521,9 @@ mod metrics_tests {
             "ii_archive_virtual_memory_pages{kind=\"log_data\"}",
             "ii_archive_virtual_memory_pages{kind=\"anchor_index\"}",
             "ii_archive_stable_memory_pages",
+            "stable_memory_bytes",
+            "ii_archive_heap_pages",
+            "heap_memory_bytes",
             // The metrics
             //   * ii_archive_last_successful_fetch_timestamp_seconds
             //   * ii_archive_last_successful_fetch_entries_count
@@ -537,7 +540,7 @@ mod metrics_tests {
             let (_, metric_timestamp) = parse_metric(&metrics_body, metric);
             assert_eq!(
                 metric_timestamp,
-                env.time(),
+                Duration::from_nanos(time(&env)).as_millis() as u64,
                 "metric timestamp did not match state machine time"
             )
         }
@@ -553,24 +556,16 @@ mod metrics_tests {
         assert_metric(
             &get_metrics(&env, canister_id),
             "ii_archive_last_upgrade_timestamp_seconds",
-            env.time()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
+            Duration::from_nanos(time(&env)).as_secs() as f64,
         );
-        println!("{}", get_metrics(&env, canister_id));
 
         env.advance_time(Duration::from_secs(300));
         upgrade_archive_canister(&env, canister_id, ARCHIVE_WASM.clone());
 
-        println!("{}", get_metrics(&env, canister_id));
         assert_metric(
             &get_metrics(&env, canister_id),
             "ii_archive_last_upgrade_timestamp_seconds",
-            env.time()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
+            Duration::from_nanos(time(&env)).as_secs() as f64,
         );
         Ok(())
     }
@@ -677,6 +672,21 @@ mod metrics_tests {
             "ii_archive_stable_memory_pages",
             3074f64, // the memory_manager pre-allocates a lot of memory (1024 page buckets per virtual memory and some overhead)
         );
+        assert_metric(
+            &get_metrics(&env, canister_id),
+            "stable_memory_bytes",
+            3074f64 * WASM_PAGE_SIZE as f64, // the memory_manager pre-allocates a lot of memory (1024 page buckets per virtual memory and some overhead)
+        );
+        assert_metric(
+            &get_metrics(&env, canister_id),
+            "ii_archive_heap_pages",
+            49f64,
+        );
+        assert_metric(
+            &get_metrics(&env, canister_id),
+            "heap_memory_bytes",
+            49f64 * WASM_PAGE_SIZE as f64,
+        );
 
         api::add_entry(
             &env,
@@ -706,6 +716,21 @@ mod metrics_tests {
             &get_metrics(&env, canister_id),
             "ii_archive_stable_memory_pages",
             3074f64, // does not change due to pre-allocation
+        );
+        assert_metric(
+            &get_metrics(&env, canister_id),
+            "stable_memory_bytes",
+            3074f64 * WASM_PAGE_SIZE as f64, // does not change due to pre-allocation
+        );
+        assert_metric(
+            &get_metrics(&env, canister_id),
+            "ii_archive_heap_pages", // does not change due to pre-allocation
+            51f64,
+        );
+        assert_metric(
+            &get_metrics(&env, canister_id),
+            "heap_memory_bytes", // does not change due to pre-allocation
+            51f64 * WASM_PAGE_SIZE as f64,
         );
 
         Ok(())

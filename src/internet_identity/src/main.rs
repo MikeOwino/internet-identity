@@ -4,11 +4,14 @@ use crate::anchor_management::tentative_device_registration::{
 };
 use crate::archive::ArchiveState;
 use crate::assets::init_assets;
+use crate::state::persistent_state;
+use crate::stats::event_stats::all_aggregations_top_n;
+use anchor_management::registration;
 use authz_utils::{
     anchor_operation_with_authz_check, check_authorization, check_authz_and_record_activity,
 };
-use candid::{candid_method, Principal};
-use canister_sig_util::signature_map::LABEL_SIG;
+use candid::Principal;
+use ic_canister_sig_creation::signature_map::LABEL_SIG;
 use ic_cdk::api::{caller, set_certified_data, trap};
 use ic_cdk::call;
 use ic_cdk_macros::{init, post_upgrade, pre_upgrade, query, update};
@@ -21,9 +24,9 @@ use internet_identity_interface::internet_identity::types::vc_mvp::{
 use internet_identity_interface::internet_identity::types::*;
 use serde_bytes::ByteBuf;
 use std::collections::HashMap;
+use std::ops::Not;
 use storage::{Salt, Storage};
 
-mod activity_stats;
 mod anchor_management;
 mod archive;
 mod assets;
@@ -32,10 +35,11 @@ mod authz_utils;
 /// Type conversions between internal and external types.
 mod conversions;
 mod delegation;
-mod hash;
 mod http;
 mod ii_domain;
+mod openid;
 mod state;
+mod stats;
 mod storage;
 mod vc_mvp;
 
@@ -54,27 +58,23 @@ const INTERNETCOMPUTER_ORG_DOMAIN: &str = "identity.internetcomputer.org";
 const INTERNETCOMPUTER_ORG_ORIGIN: &str = "https://identity.internetcomputer.org";
 
 #[update]
-#[candid_method]
 async fn init_salt() {
     state::init_salt().await;
 }
 
 #[update]
-#[candid_method]
 fn enter_device_registration_mode(anchor_number: AnchorNumber) -> Timestamp {
     check_authz_and_record_activity(anchor_number).unwrap_or_else(|err| trap(&format!("{err}")));
     tentative_device_registration::enter_device_registration_mode(anchor_number)
 }
 
 #[update]
-#[candid_method]
 fn exit_device_registration_mode(anchor_number: AnchorNumber) {
     check_authz_and_record_activity(anchor_number).unwrap_or_else(|err| trap(&format!("{err}")));
     tentative_device_registration::exit_device_registration_mode(anchor_number)
 }
 
 #[update]
-#[candid_method]
 async fn add_tentative_device(
     anchor_number: AnchorNumber,
     device_data: DeviceData,
@@ -105,7 +105,6 @@ async fn add_tentative_device(
 }
 
 #[update]
-#[candid_method]
 fn verify_tentative_device(
     anchor_number: AnchorNumber,
     user_verification_code: DeviceVerificationCode,
@@ -138,13 +137,11 @@ fn verify_tentative_device(
 }
 
 #[update]
-#[candid_method]
 async fn create_challenge() -> Challenge {
-    anchor_management::registration::create_challenge().await
+    registration::create_challenge().await
 }
 
 #[update]
-#[candid_method]
 fn register(
     device_data: DeviceData,
     challenge_result: ChallengeAttempt,
@@ -154,7 +151,6 @@ fn register(
 }
 
 #[update]
-#[candid_method]
 fn add(anchor_number: AnchorNumber, device_data: DeviceData) {
     anchor_operation_with_authz_check(anchor_number, |anchor| {
         Ok::<_, String>(((), anchor_management::add(anchor, device_data)))
@@ -163,7 +159,6 @@ fn add(anchor_number: AnchorNumber, device_data: DeviceData) {
 }
 
 #[update]
-#[candid_method]
 fn update(anchor_number: AnchorNumber, device_key: DeviceKey, device_data: DeviceData) {
     anchor_operation_with_authz_check(anchor_number, |anchor| {
         Ok::<_, String>((
@@ -175,7 +170,6 @@ fn update(anchor_number: AnchorNumber, device_key: DeviceKey, device_data: Devic
 }
 
 #[update]
-#[candid_method]
 fn replace(anchor_number: AnchorNumber, device_key: DeviceKey, device_data: DeviceData) {
     anchor_operation_with_authz_check(anchor_number, |anchor| {
         Ok::<_, String>((
@@ -187,7 +181,6 @@ fn replace(anchor_number: AnchorNumber, device_key: DeviceKey, device_data: Devi
 }
 
 #[update]
-#[candid_method]
 fn remove(anchor_number: AnchorNumber, device_key: DeviceKey) {
     anchor_operation_with_authz_check(anchor_number, |anchor| {
         Ok::<_, String>((
@@ -201,7 +194,6 @@ fn remove(anchor_number: AnchorNumber, device_key: DeviceKey) {
 /// Returns all devices of the anchor (authentication and recovery) but no information about device registrations.
 /// Deprecated: use [get_anchor_credentials] instead
 #[query]
-#[candid_method(query)]
 fn lookup(anchor_number: AnchorNumber) -> Vec<DeviceData> {
     let Ok(anchor) = state::storage_borrow(|storage| storage.read(anchor_number)) else {
         return vec![];
@@ -220,7 +212,6 @@ fn lookup(anchor_number: AnchorNumber) -> Vec<DeviceData> {
 }
 
 #[query]
-#[candid_method(query)]
 fn get_anchor_credentials(anchor_number: AnchorNumber) -> AnchorCredentials {
     let Ok(anchor) = state::storage_borrow(|storage| storage.read(anchor_number)) else {
         return AnchorCredentials::default();
@@ -252,14 +243,12 @@ fn get_anchor_credentials(anchor_number: AnchorNumber) -> AnchorCredentials {
 }
 
 #[update] // this is an update call because queries are not (yet) certified
-#[candid_method]
 fn get_anchor_info(anchor_number: AnchorNumber) -> IdentityAnchorInfo {
     check_authz_and_record_activity(anchor_number).unwrap_or_else(|err| trap(&format!("{err}")));
     anchor_management::get_anchor_info(anchor_number)
 }
 
 #[query]
-#[candid_method(query)]
 fn get_principal(anchor_number: AnchorNumber, frontend: FrontendHostname) -> Principal {
     let Ok(_) = check_authorization(anchor_number) else {
         trap(&format!("{} could not be authenticated.", caller()));
@@ -268,7 +257,6 @@ fn get_principal(anchor_number: AnchorNumber, frontend: FrontendHostname) -> Pri
 }
 
 #[update]
-#[candid_method]
 async fn prepare_delegation(
     anchor_number: AnchorNumber,
     frontend: FrontendHostname,
@@ -288,7 +276,6 @@ async fn prepare_delegation(
 }
 
 #[query]
-#[candid_method(query)]
 fn get_delegation(
     anchor_number: AnchorNumber,
     frontend: FrontendHostname,
@@ -302,19 +289,16 @@ fn get_delegation(
 }
 
 #[query]
-#[candid_method(query)]
 fn http_request(req: HttpRequest) -> HttpResponse {
     http::http_request(req)
 }
 
 #[update]
-#[candid_method]
 fn http_request_update(req: HttpRequest) -> HttpResponse {
     http::http_request(req)
 }
 
 #[query]
-#[candid_method(query)]
 fn stats() -> InternetIdentityStats {
     let archive_info = match state::archive_state() {
         ArchiveState::NotConfigured => ArchiveInfo {
@@ -336,20 +320,7 @@ fn stats() -> InternetIdentityStats {
     let canister_creation_cycles_cost =
         state::persistent_state(|persistent_state| persistent_state.canister_creation_cycles_cost);
 
-    let (latest_delegation_origins, max_num_latest_delegation_origins) =
-        state::persistent_state(|persistent_state| {
-            let origins = persistent_state
-                .latest_delegation_origins
-                .as_ref()
-                .map(|latest_delegation_origins| {
-                    latest_delegation_origins.keys().cloned().collect()
-                })
-                .unwrap_or_default();
-            (
-                origins,
-                persistent_state.max_num_latest_delegation_origins.unwrap(),
-            )
-        });
+    let event_aggregations = all_aggregations_top_n(100);
 
     state::storage_borrow(|storage| InternetIdentityStats {
         assigned_user_number_range: storage.assigned_anchor_number_range(),
@@ -357,13 +328,32 @@ fn stats() -> InternetIdentityStats {
         archive_info,
         canister_creation_cycles_cost,
         storage_layout_version: storage.version(),
-        max_num_latest_delegation_origins,
-        latest_delegation_origins,
+        event_aggregations,
+    })
+}
+
+#[query]
+fn config() -> InternetIdentityInit {
+    let archive_config = match state::archive_state() {
+        ArchiveState::NotConfigured => None,
+        ArchiveState::Configured { config } | ArchiveState::CreationInProgress { config, .. } => {
+            Some(config)
+        }
+        ArchiveState::Created { config, .. } => Some(config),
+    };
+    let user_range = state::storage_borrow(|s| s.assigned_anchor_number_range());
+    persistent_state(|persistent_state| InternetIdentityInit {
+        assigned_user_number_range: Some(user_range),
+        archive_config,
+        canister_creation_cycles_cost: Some(persistent_state.canister_creation_cycles_cost),
+        register_rate_limit: Some(persistent_state.registration_rate_limit.clone()),
+        captcha_config: Some(persistent_state.captcha_config.clone()),
+        related_origins: persistent_state.related_origins.clone(),
+        openid_google: Some(persistent_state.openid_google.clone()),
     })
 }
 
 #[update]
-#[candid_method]
 async fn deploy_archive(wasm: ByteBuf) -> DeployArchiveResult {
     archive::deploy_archive(wasm).await
 }
@@ -372,7 +362,6 @@ async fn deploy_archive(wasm: ByteBuf) -> DeployArchiveResult {
 /// This is an update call because the archive information _must_ be certified.
 /// Only callable by this IIs archive canister.
 #[update]
-#[candid_method]
 fn fetch_entries() -> Vec<BufferedEntry> {
     archive::fetch_entries()
 }
@@ -380,36 +369,40 @@ fn fetch_entries() -> Vec<BufferedEntry> {
 /// Removes all buffered archive entries up to sequence number.
 /// Only callable by this IIs archive canister.
 #[update]
-#[candid_method]
 fn acknowledge_entries(sequence_number: u64) {
     archive::acknowledge_entries(sequence_number)
 }
 
 #[init]
-#[candid_method(init)]
 fn init(maybe_arg: Option<InternetIdentityInit>) {
-    init_assets();
     state::init_new();
-
-    apply_install_arg(maybe_arg);
-
-    // make sure the fully initialized storage configuration is written to stable memory
-    state::storage_borrow_mut(|storage| storage.flush());
-    update_root_hash();
+    initialize(maybe_arg);
 }
 
 #[post_upgrade]
 fn post_upgrade(maybe_arg: Option<InternetIdentityInit>) {
-    init_assets();
     state::init_from_stable_memory();
-
-    // We drop all the signatures on upgrade, users will
-    // re-request them if needed.
-    update_root_hash();
-    // load the persistent state after initializing storage, otherwise the memory address to load it from cannot be calculated
+    // load the persistent state after initializing storage as it manages the respective stable cell
     state::load_persistent_state();
 
+    initialize(maybe_arg);
+}
+
+fn initialize(maybe_arg: Option<InternetIdentityInit>) {
+    let related_origins = maybe_arg
+        .as_ref()
+        .and_then(|arg| arg.related_origins.clone())
+        .unwrap_or(persistent_state(|storage| storage.related_origins.clone()).unwrap_or(vec![]));
+    let openid_google = maybe_arg
+        .as_ref()
+        .and_then(|arg| arg.openid_google.clone())
+        .unwrap_or(persistent_state(|storage| storage.openid_google.clone()));
+    init_assets(related_origins.is_empty().not().then_some(related_origins));
     apply_install_arg(maybe_arg);
+    update_root_hash();
+    if let Some(config) = openid_google {
+        openid::setup_google(config);
+    }
 }
 
 fn apply_install_arg(maybe_arg: Option<InternetIdentityInit>) {
@@ -429,17 +422,22 @@ fn apply_install_arg(maybe_arg: Option<InternetIdentityInit>) {
         }
         if let Some(rate_limit) = arg.register_rate_limit {
             state::persistent_state_mut(|persistent_state| {
-                persistent_state.registration_rate_limit = Some(rate_limit);
+                persistent_state.registration_rate_limit = rate_limit;
             })
         }
-        if let Some(limit) = arg.max_num_latest_delegation_origins {
+        if let Some(captcha_config) = arg.captcha_config {
             state::persistent_state_mut(|persistent_state| {
-                persistent_state.max_num_latest_delegation_origins = Some(limit);
+                persistent_state.captcha_config = captcha_config;
             })
         }
-        if let Some(limit) = arg.max_inflight_captchas {
+        if let Some(related_origins) = arg.related_origins {
             state::persistent_state_mut(|persistent_state| {
-                persistent_state.max_inflight_captchas = Some(limit);
+                persistent_state.related_origins = Some(related_origins);
+            })
+        }
+        if let Some(openid_google) = arg.openid_google {
+            state::persistent_state_mut(|persistent_state| {
+                persistent_state.openid_google = openid_google;
             })
         }
     }
@@ -505,7 +503,6 @@ mod v2_api {
     use super::*;
 
     #[query]
-    #[candid_method(query)]
     fn identity_authn_info(identity_number: IdentityNumber) -> Result<IdentityAuthnInfo, ()> {
         let Ok(anchor) = state::storage_borrow(|storage| storage.read(identity_number)) else {
             return Ok(IdentityAuthnInfo {
@@ -543,31 +540,23 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
-    async fn captcha_create() -> Result<Challenge, ()> {
-        let challenge = anchor_management::registration::create_challenge().await;
-        Ok(challenge)
+    async fn identity_registration_start() -> Result<IdRegNextStepResult, IdRegStartError> {
+        registration::registration_flow_v2::identity_registration_start().await
     }
 
     #[update]
-    #[candid_method]
-    fn identity_register(
-        authn_method: AuthnMethodData,
-        challenge_result: ChallengeAttempt,
-        temp_key: Option<Principal>,
-    ) -> Result<IdentityNumber, IdentityRegisterError> {
-        let device = DeviceWithUsage::try_from(authn_method)
-            .map_err(|err| IdentityRegisterError::InvalidMetadata(err.to_string()))?;
-
-        match register(DeviceData::from(device), challenge_result, temp_key) {
-            RegisterResponse::Registered { user_number } => Ok(user_number),
-            RegisterResponse::CanisterFull => Err(IdentityRegisterError::CanisterFull),
-            RegisterResponse::BadChallenge => Err(IdentityRegisterError::BadCaptcha),
-        }
+    async fn check_captcha(arg: CheckCaptchaArg) -> Result<IdRegNextStepResult, CheckCaptchaError> {
+        registration::registration_flow_v2::check_captcha(arg).await
     }
 
     #[update]
-    #[candid_method]
+    fn identity_registration_finish(
+        arg: IdRegFinishArg,
+    ) -> Result<IdRegFinishResult, IdRegFinishError> {
+        registration::registration_flow_v2::identity_registration_finish(arg)
+    }
+
+    #[update]
     fn identity_info(identity_number: IdentityNumber) -> Result<IdentityInfo, IdentityInfoError> {
         check_authz_and_record_activity(identity_number).map_err(IdentityInfoError::from)?;
         let anchor_info = anchor_management::get_anchor_info(identity_number);
@@ -595,7 +584,6 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn authn_method_add(
         identity_number: IdentityNumber,
         authn_method: AuthnMethodData,
@@ -606,7 +594,6 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn authn_method_remove(
         identity_number: IdentityNumber,
         public_key: PublicKey,
@@ -616,7 +603,6 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn authn_method_replace(
         identity_number: IdentityNumber,
         authn_method_pk: PublicKey,
@@ -630,7 +616,6 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn authn_method_metadata_replace(
         identity_number: IdentityNumber,
         authn_method_pk: PublicKey,
@@ -657,7 +642,6 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn authn_method_security_settings_replace(
         identity_number: IdentityNumber,
         authn_method_pk: PublicKey,
@@ -679,7 +663,6 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn identity_metadata_replace(
         identity_number: IdentityNumber,
         metadata: HashMap<String, MetadataEntryV2>,
@@ -698,7 +681,6 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn authn_method_registration_mode_enter(
         identity_number: IdentityNumber,
     ) -> Result<RegistrationModeInfo, ()> {
@@ -709,14 +691,12 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn authn_method_registration_mode_exit(identity_number: IdentityNumber) -> Result<(), ()> {
         exit_device_registration_mode(identity_number);
         Ok(())
     }
 
     #[update]
-    #[candid_method]
     async fn authn_method_register(
         identity_number: IdentityNumber,
         authn_method: AuthnMethodData,
@@ -742,7 +722,6 @@ mod v2_api {
     }
 
     #[update]
-    #[candid_method]
     fn authn_method_confirm(
         identity_number: IdentityNumber,
         confirmation_code: String,
@@ -768,7 +747,6 @@ mod attribute_sharing_mvp {
     use super::*;
 
     #[update]
-    #[candid_method]
     async fn prepare_id_alias(
         req: PrepareIdAliasRequest,
     ) -> Result<PreparedIdAlias, PrepareIdAliasError> {
@@ -785,7 +763,6 @@ mod attribute_sharing_mvp {
     }
 
     #[query]
-    #[candid_method(query)]
     fn get_id_alias(req: GetIdAliasRequest) -> Result<IdAliasCredentials, GetIdAliasError> {
         check_authorization(req.identity_number).map_err(GetIdAliasError::from)?;
         vc_mvp::get_id_alias(
@@ -802,7 +779,7 @@ mod attribute_sharing_mvp {
 
 fn main() {}
 
-// Order dependent: do not move above any function annotated with #[candid_method]!
+// Order dependent: do not move above any exposed canister method!
 candid::export_service!();
 
 #[cfg(test)]

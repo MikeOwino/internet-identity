@@ -1,5 +1,5 @@
 name: 'Setup nodejs'
-description: Setup nodejs
+description: Setup nodejs and other frontend tools used in the frontend build
 runs:
   using: "composite"
   steps:
@@ -7,6 +7,13 @@ runs:
       shell: bash
       id: read-node-version
       run: echo "version=$(cat .node-version)" >> "$GITHUB_OUTPUT"
+
+    - name: Install wasm-pack
+      shell: bash
+      run: |
+        curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        cargo --version
+        wasm-pack --version
 
     - uses: actions/setup-node@v4
       with:

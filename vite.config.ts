@@ -1,10 +1,11 @@
 import {
   compression,
   injectCanisterIdPlugin,
-  integrityPlugin,
+  inlineScriptsPlugin,
   minifyHTML,
   replicaForwardPlugin,
 } from "@dfinity/internet-identity-vite-plugins";
+import { readReplicaPort } from "@dfinity/internet-identity-vite-plugins/utils";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 import { resolve } from "path";
 import { AliasOptions, UserConfig, defineConfig } from "vite";
@@ -18,7 +19,7 @@ export const aliasConfig: AliasOptions = {
   $showcase: resolve(__dirname, "src/showcase/src"),
 };
 
-export default defineConfig(({ mode }: UserConfig): UserConfig => {
+export default defineConfig(({ command, mode }): UserConfig => {
   // Expand process.env variables with default values to ensure build reproducibility
   process.env = {
     ...process.env,
@@ -26,6 +27,9 @@ export default defineConfig(({ mode }: UserConfig): UserConfig => {
     II_DUMMY_AUTH: `${process.env.II_DUMMY_AUTH ?? "0"}`,
     II_DUMMY_CAPTCHA: `${process.env.II_DUMMY_CAPTCHA ?? "0"}`,
     II_VERSION: `${process.env.II_VERSION ?? ""}`,
+    II_OPENID_GOOGLE_CLIENT_ID: `${
+      process.env.II_OPENID_GOOGLE_CLIENT_ID ?? ""
+    }`,
   };
 
   // Path "../../" have to be expressed relative to the "root".
@@ -54,8 +58,10 @@ export default defineConfig(({ mode }: UserConfig): UserConfig => {
         output: {
           entryFileNames: `[name].js`,
           // II canister only supports resources that contains a single dot in their filenames. qr-creator.js.gz = ok. qr-creator.min.js.gz not ok. qr-creator.es6.min.js.gz no ok.
-          chunkFileNames: ({ name }) => `${name.replace(/.es6|.min/gm, "")}.js`,
-          assetFileNames: `[name].[ext]`,
+          chunkFileNames: (chunkInfo) =>
+            `${chunkInfo.name.replace(/.es6|.min/gm, "")}-[hash]-cacheable.js`,
+
+          assetFileNames: `[name]-[hash]-cacheable.[ext]`,
         },
       },
       commonjsOptions: {
@@ -64,7 +70,7 @@ export default defineConfig(({ mode }: UserConfig): UserConfig => {
       },
     },
     plugins: [
-      integrityPlugin,
+      inlineScriptsPlugin,
       [
         ...(mode === "development"
           ? [injectCanisterIdPlugin({ canisterName: "internet_identity" })]
@@ -72,24 +78,33 @@ export default defineConfig(({ mode }: UserConfig): UserConfig => {
       ],
       [...(mode === "production" ? [minifyHTML(), compression()] : [])],
       [...(process.env.TLS_DEV_SERVER === "1" ? [basicSsl()] : [])],
-      replicaForwardPlugin({
-        replicaOrigin: "127.0.0.1:4943",
-        forwardDomains: ["icp0.io", "ic0.app"],
-        forwardRules: [
-          {
-            hosts: ["nice-name.com"],
-            canisterName: "test_app",
-          },
-          ...(process.env.NO_HOT_RELOAD === "1"
-            ? [
-                {
-                  hosts: ["identity.ic0.app", "identity.internetcomputer.org"],
-                  canisterName: "internet_identity",
-                },
-              ]
-            : []),
-        ],
-      }),
+      {
+        ...replicaForwardPlugin({
+          forwardDomains: ["icp0.io", "ic0.app"],
+          forwardRules: [
+            {
+              hosts: ["nice-name.com"],
+              canisterName: "test_app",
+            },
+            {
+              hosts: ["nice-issuer-custom-orig.com"],
+              canisterName: "issuer",
+            },
+            ...(process.env.NO_HOT_RELOAD === "1"
+              ? [
+                  {
+                    hosts: [
+                      "identity.ic0.app",
+                      "identity.internetcomputer.org",
+                    ],
+                    canisterName: "internet_identity",
+                  },
+                ]
+              : []),
+          ],
+        }),
+        apply: "serve",
+      },
     ],
     optimizeDeps: {
       esbuildOptions: {
@@ -98,11 +113,14 @@ export default defineConfig(({ mode }: UserConfig): UserConfig => {
         },
       },
     },
-    server: {
-      https: process.env.TLS_DEV_SERVER === "1",
-      proxy: {
-        "/api": "http://127.0.0.1:4943",
-      },
-    },
+    server:
+      command !== "serve"
+        ? {}
+        : {
+            https: process.env.TLS_DEV_SERVER === "1",
+            proxy: {
+              "/api": `http://127.0.0.1:${readReplicaPort()}`,
+            },
+          },
   };
 });

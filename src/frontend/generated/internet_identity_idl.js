@@ -1,22 +1,38 @@
 export const idlFactory = ({ IDL }) => {
   const MetadataMap = IDL.Rec();
   const MetadataMapV2 = IDL.Rec();
+  const OpenIdConfig = IDL.Record({ 'client_id' : IDL.Text });
   const ArchiveConfig = IDL.Record({
     'polling_interval_ns' : IDL.Nat64,
     'entries_buffer_limit' : IDL.Nat64,
     'module_hash' : IDL.Vec(IDL.Nat8),
     'entries_fetch_limit' : IDL.Nat16,
   });
+  const CaptchaConfig = IDL.Record({
+    'max_unsolved_captchas' : IDL.Nat64,
+    'captcha_trigger' : IDL.Variant({
+      'Dynamic' : IDL.Record({
+        'reference_rate_sampling_interval_s' : IDL.Nat64,
+        'threshold_pct' : IDL.Nat16,
+        'current_rate_sampling_interval_s' : IDL.Nat64,
+      }),
+      'Static' : IDL.Variant({
+        'CaptchaDisabled' : IDL.Null,
+        'CaptchaEnabled' : IDL.Null,
+      }),
+    }),
+  });
   const RateLimitConfig = IDL.Record({
     'max_tokens' : IDL.Nat64,
     'time_per_token_ns' : IDL.Nat64,
   });
   const InternetIdentityInit = IDL.Record({
-    'max_num_latest_delegation_origins' : IDL.Opt(IDL.Nat64),
+    'openid_google' : IDL.Opt(IDL.Opt(OpenIdConfig)),
     'assigned_user_number_range' : IDL.Opt(IDL.Tuple(IDL.Nat64, IDL.Nat64)),
-    'max_inflight_captchas' : IDL.Opt(IDL.Nat64),
     'archive_config' : IDL.Opt(ArchiveConfig),
     'canister_creation_cycles_cost' : IDL.Opt(IDL.Nat64),
+    'related_origins' : IDL.Opt(IDL.Vec(IDL.Text)),
+    'captcha_config' : IDL.Opt(CaptchaConfig),
     'register_rate_limit' : IDL.Opt(RateLimitConfig),
   });
   const UserNumber = IDL.Nat64;
@@ -134,6 +150,19 @@ export const idlFactory = ({ IDL }) => {
   });
   const AuthnMethodSecuritySettingsReplaceError = IDL.Variant({
     'AuthnMethodNotFound' : IDL.Null,
+  });
+  const CheckCaptchaArg = IDL.Record({ 'solution' : IDL.Text });
+  const RegistrationFlowNextStep = IDL.Variant({
+    'CheckCaptcha' : IDL.Record({ 'captcha_png_base64' : IDL.Text }),
+    'Finish' : IDL.Null,
+  });
+  const IdRegNextStepResult = IDL.Record({
+    'next_step' : RegistrationFlowNextStep,
+  });
+  const CheckCaptchaError = IDL.Variant({
+    'NoRegistrationFlow' : IDL.Null,
+    'UnexpectedCall' : IDL.Record({ 'next_step' : RegistrationFlowNextStep }),
+    'WrongSolution' : IDL.Record({ 'new_captcha_png_base64' : IDL.Text }),
   });
   const ChallengeKey = IDL.Text;
   const Challenge = IDL.Record({
@@ -270,15 +299,19 @@ export const idlFactory = ({ IDL }) => {
       'space_available' : IDL.Nat64,
     }),
   });
-  const ChallengeResult = IDL.Record({
-    'key' : ChallengeKey,
-    'chars' : IDL.Text,
+  const IdRegFinishArg = IDL.Record({ 'authn_method' : AuthnMethodData });
+  const IdRegFinishResult = IDL.Record({ 'identity_number' : IDL.Nat64 });
+  const IdRegFinishError = IDL.Variant({
+    'NoRegistrationFlow' : IDL.Null,
+    'UnexpectedCall' : IDL.Record({ 'next_step' : RegistrationFlowNextStep }),
+    'InvalidAuthnMethod' : IDL.Text,
+    'IdentityLimitReached' : IDL.Null,
+    'StorageError' : IDL.Text,
   });
-  const CaptchaResult = ChallengeResult;
-  const IdentityRegisterError = IDL.Variant({
-    'BadCaptcha' : IDL.Null,
-    'CanisterFull' : IDL.Null,
-    'InvalidMetadata' : IDL.Text,
+  const IdRegStartError = IDL.Variant({
+    'InvalidCaller' : IDL.Null,
+    'AlreadyInProgress' : IDL.Null,
+    'RateLimitExceeded' : IDL.Null,
   });
   const UserKey = PublicKey;
   const PrepareIdAliasRequest = IDL.Record({
@@ -295,6 +328,10 @@ export const idlFactory = ({ IDL }) => {
     'InternalCanisterError' : IDL.Text,
     'Unauthorized' : IDL.Principal,
   });
+  const ChallengeResult = IDL.Record({
+    'key' : ChallengeKey,
+    'chars' : IDL.Text,
+  });
   const RegisterResponse = IDL.Variant({
     'bad_challenge' : IDL.Null,
     'canister_full' : IDL.Null,
@@ -307,11 +344,12 @@ export const idlFactory = ({ IDL }) => {
   const InternetIdentityStats = IDL.Record({
     'storage_layout_version' : IDL.Nat8,
     'users_registered' : IDL.Nat64,
-    'max_num_latest_delegation_origins' : IDL.Nat64,
     'assigned_user_number_range' : IDL.Tuple(IDL.Nat64, IDL.Nat64),
-    'latest_delegation_origins' : IDL.Vec(FrontendHostname),
     'archive_info' : ArchiveInfo,
     'canister_creation_cycles_cost' : IDL.Nat64,
+    'event_aggregations' : IDL.Vec(
+      IDL.Tuple(IDL.Text, IDL.Vec(IDL.Tuple(IDL.Text, IDL.Nat64)))
+    ),
   });
   const VerifyTentativeDeviceResponse = IDL.Variant({
     'device_registration_mode_off' : IDL.Null,
@@ -397,11 +435,17 @@ export const idlFactory = ({ IDL }) => {
         ],
         [],
       ),
-    'captcha_create' : IDL.Func(
-        [],
-        [IDL.Variant({ 'Ok' : Challenge, 'Err' : IDL.Null })],
+    'check_captcha' : IDL.Func(
+        [CheckCaptchaArg],
+        [
+          IDL.Variant({
+            'Ok' : IdRegNextStepResult,
+            'Err' : CheckCaptchaError,
+          }),
+        ],
         [],
       ),
+    'config' : IDL.Func([], [InternetIdentityInit], ['query']),
     'create_challenge' : IDL.Func([], [Challenge], []),
     'deploy_archive' : IDL.Func([IDL.Vec(IDL.Nat8)], [DeployArchiveResult], []),
     'enter_device_registration_mode' : IDL.Func([UserNumber], [Timestamp], []),
@@ -450,9 +494,14 @@ export const idlFactory = ({ IDL }) => {
         ],
         [],
       ),
-    'identity_register' : IDL.Func(
-        [AuthnMethodData, CaptchaResult, IDL.Opt(IDL.Principal)],
-        [IDL.Variant({ 'Ok' : IdentityNumber, 'Err' : IdentityRegisterError })],
+    'identity_registration_finish' : IDL.Func(
+        [IdRegFinishArg],
+        [IDL.Variant({ 'Ok' : IdRegFinishResult, 'Err' : IdRegFinishError })],
+        [],
+      ),
+    'identity_registration_start' : IDL.Func(
+        [],
+        [IDL.Variant({ 'Ok' : IdRegNextStepResult, 'Err' : IdRegStartError })],
         [],
       ),
     'init_salt' : IDL.Func([], [], []),
@@ -484,22 +533,38 @@ export const idlFactory = ({ IDL }) => {
   });
 };
 export const init = ({ IDL }) => {
+  const OpenIdConfig = IDL.Record({ 'client_id' : IDL.Text });
   const ArchiveConfig = IDL.Record({
     'polling_interval_ns' : IDL.Nat64,
     'entries_buffer_limit' : IDL.Nat64,
     'module_hash' : IDL.Vec(IDL.Nat8),
     'entries_fetch_limit' : IDL.Nat16,
   });
+  const CaptchaConfig = IDL.Record({
+    'max_unsolved_captchas' : IDL.Nat64,
+    'captcha_trigger' : IDL.Variant({
+      'Dynamic' : IDL.Record({
+        'reference_rate_sampling_interval_s' : IDL.Nat64,
+        'threshold_pct' : IDL.Nat16,
+        'current_rate_sampling_interval_s' : IDL.Nat64,
+      }),
+      'Static' : IDL.Variant({
+        'CaptchaDisabled' : IDL.Null,
+        'CaptchaEnabled' : IDL.Null,
+      }),
+    }),
+  });
   const RateLimitConfig = IDL.Record({
     'max_tokens' : IDL.Nat64,
     'time_per_token_ns' : IDL.Nat64,
   });
   const InternetIdentityInit = IDL.Record({
-    'max_num_latest_delegation_origins' : IDL.Opt(IDL.Nat64),
+    'openid_google' : IDL.Opt(IDL.Opt(OpenIdConfig)),
     'assigned_user_number_range' : IDL.Opt(IDL.Tuple(IDL.Nat64, IDL.Nat64)),
-    'max_inflight_captchas' : IDL.Opt(IDL.Nat64),
     'archive_config' : IDL.Opt(ArchiveConfig),
     'canister_creation_cycles_cost' : IDL.Opt(IDL.Nat64),
+    'related_origins' : IDL.Opt(IDL.Vec(IDL.Text)),
+    'captcha_config' : IDL.Opt(CaptchaConfig),
     'register_rate_limit' : IDL.Opt(RateLimitConfig),
   });
   return [IDL.Opt(InternetIdentityInit)];

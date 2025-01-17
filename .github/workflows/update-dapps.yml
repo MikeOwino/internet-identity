@@ -4,12 +4,12 @@ name: Dapps Update
 on:
   schedule:
     # Check for updates daily
-    - cron:  '0 0 * * *'
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
   dapps-update:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-node
@@ -26,19 +26,20 @@ jobs:
       # If the dapps changed, create a PR.
       # This action creates a PR only if there are changes.
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v4
+        uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GIX_BOT_PAT }}
           base: main
           add-paths: |
             src/frontend/src/flows/dappsExplorer/dapps.json
-            src/frontend/assets/icons
+            src/frontend/src/assets/icons
           commit-message: Update dapps
           committer: GitHub <noreply@github.com>
           author: gix-bot <gix-bot@users.noreply.github.com>
           branch: bot-dapps-update
           delete-branch: true
-          title: 'Update dapps list'
+          title:
+            "Update dapps list"
 
             # Since the this is a scheduled job, a failure won't be shown on any
             # PR status. To notify the team, we send a message to our Slack channel on failure.

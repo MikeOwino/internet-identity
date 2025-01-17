@@ -1,17 +1,29 @@
 //! Tests for the HTTP interactions according to the HTTP gateway spec: https://internetcomputer.org/docs/current/references/ic-interface-spec/#http-gateway
 //! Includes tests for the HTTP endpoint (including asset certification) and the metrics endpoint.
 
+use crate::v2_api::authn_method_test_helpers::{
+    create_identity_with_authn_method, create_identity_with_authn_methods,
+    sample_pubkey_authn_method, test_authn_method,
+};
 use canister_tests::api::{http_request, internet_identity as api};
 use canister_tests::flows;
 use canister_tests::framework::*;
+use flate2::read::GzDecoder;
 use ic_cdk::api::management_canister::main::CanisterId;
 use ic_response_verification::types::VerificationInfo;
 use ic_response_verification::verify_request_response_pair;
-use ic_test_state_machine_client::{CallError, StateMachine};
 use internet_identity_interface::http_gateway::{HttpRequest, HttpResponse};
-use internet_identity_interface::internet_identity::types::ChallengeAttempt;
+use internet_identity_interface::internet_identity::types::vc_mvp::PrepareIdAliasRequest;
+use internet_identity_interface::internet_identity::types::{
+    AuthnMethodData, CaptchaConfig, CaptchaTrigger, ChallengeAttempt, FrontendHostname,
+    InternetIdentityInit, MetadataEntryV2,
+};
+use pocket_ic::{CallError, PocketIc};
 use serde_bytes::ByteBuf;
-use std::time::{Duration, UNIX_EPOCH};
+use serde_json::json;
+use std::collections::HashMap;
+use std::io::Read;
+use std::time::Duration;
 
 /// Verifies that some expected assets are delivered, certified and have security headers.
 #[test]
@@ -65,6 +77,137 @@ fn ii_canister_serves_http_assets() -> Result<(), CallError> {
     Ok(())
 }
 
+/// Verifies that `.well-known/webauthn` assets are delivered, certified and have security headers if present in the config.
+#[test]
+fn ii_canister_serves_webauthn_assets() -> Result<(), CallError> {
+    let env = env();
+    let related_origins: Vec<String> = [
+        "https://identity.internetcomputer.org".to_string(),
+        "https://identity.ic0.app".to_string(),
+    ]
+    .to_vec();
+    let config = InternetIdentityInit {
+        assigned_user_number_range: None,
+        archive_config: None,
+        canister_creation_cycles_cost: None,
+        register_rate_limit: None,
+        captcha_config: None,
+        related_origins: Some(related_origins.clone()),
+        openid_google: None,
+    };
+    let canister_id = install_ii_canister_with_arg(&env, II_WASM.clone(), Some(config));
+
+    for certification_version in 1..=2 {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            url: "/.well-known/webauthn".to_string(),
+            headers: vec![],
+            body: ByteBuf::new(),
+            certificate_version: Some(certification_version),
+        };
+        let http_response = http_request(&env, canister_id, &request)?;
+        let response_body = String::from_utf8_lossy(&http_response.body).to_string();
+
+        assert_eq!(http_response.status_code, 200);
+
+        let expected_content = json!({
+            "origins": related_origins,
+        })
+        .to_string();
+        assert_eq!(response_body, expected_content);
+
+        // check the appropriate Content-Type header is set
+        let (_, content_type) = http_response
+            .headers
+            .iter()
+            .find(|(name, _)| name.to_lowercase() == "content-type")
+            .expect("Content-Encoding header not found");
+        assert_eq!(
+            content_type, "application/json",
+            "unexpected Content-Encoding header value"
+        );
+        verify_security_headers(&http_response.headers);
+
+        let result = verify_response_certification(
+            &env,
+            canister_id,
+            request,
+            http_response,
+            certification_version,
+        );
+        assert_eq!(result.verification_version, certification_version);
+    }
+    Ok(())
+}
+
+#[test]
+fn ii_canister_serves_webauthn_assets_after_upgrade() -> Result<(), CallError> {
+    let env = env();
+    let related_origins: Vec<String> = [
+        "https://identity.internetcomputer.org".to_string(),
+        "https://identity.ic0.app".to_string(),
+    ]
+    .to_vec();
+    let config = InternetIdentityInit {
+        assigned_user_number_range: None,
+        archive_config: None,
+        canister_creation_cycles_cost: None,
+        register_rate_limit: None,
+        captcha_config: None,
+        related_origins: Some(related_origins.clone()),
+        openid_google: None,
+    };
+    let canister_id = install_ii_canister_with_arg(&env, II_WASM.clone(), Some(config));
+
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        url: "/.well-known/webauthn".to_string(),
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(2),
+    };
+    let http_response = http_request(&env, canister_id, &request)?;
+    let response_body = String::from_utf8_lossy(&http_response.body).to_string();
+    assert_eq!(http_response.status_code, 200);
+    let expected_content = json!({
+        "origins": related_origins,
+    })
+    .to_string();
+    assert_eq!(response_body, expected_content);
+
+    let _ = upgrade_ii_canister_with_arg(&env, canister_id, II_WASM.clone(), None);
+
+    let http_response_1 = http_request(&env, canister_id, &request)?;
+    let response_body_1 = String::from_utf8_lossy(&http_response_1.body).to_string();
+    assert_eq!(response_body_1, expected_content);
+
+    let related_origins_2: Vec<String> = [
+        "https://beta.identity.internetcomputer.org".to_string(),
+        "https://beta.identity.ic0.app".to_string(),
+    ]
+    .to_vec();
+    let config_2 = InternetIdentityInit {
+        assigned_user_number_range: None,
+        archive_config: None,
+        canister_creation_cycles_cost: None,
+        register_rate_limit: None,
+        captcha_config: None,
+        related_origins: Some(related_origins_2.clone()),
+        openid_google: None,
+    };
+
+    let _ = upgrade_ii_canister_with_arg(&env, canister_id, II_WASM.clone(), Some(config_2));
+
+    let http_response_2 = http_request(&env, canister_id, &request)?;
+    let response_body_2 = String::from_utf8_lossy(&http_response_2.body).to_string();
+    let expected_content_2 = json!({
+        "origins": related_origins_2,
+    })
+    .to_string();
+    assert_eq!(response_body_2, expected_content_2);
+    Ok(())
+}
+
 /// Verifies that clients that do not indicate any certification version will get a v1 certificate.
 #[test]
 fn should_fallback_to_v1_certification() -> Result<(), CallError> {
@@ -102,19 +245,149 @@ fn should_set_cache_control_for_fonts() -> Result<(), CallError> {
     let env = env();
     let canister_id = install_ii_canister(&env, II_WASM.clone());
 
-    let request = HttpRequest {
+    // Get index page
+    let index_request = HttpRequest {
         method: "GET".to_string(),
-        url: "/CircularXXWeb-Regular.woff2".to_string(),
+        url: "/".to_string(),
         headers: vec![],
         body: ByteBuf::new(),
         certificate_version: Some(CERTIFICATION_VERSION),
     };
+    let index_response = http_request(&env, canister_id, &index_request)?;
+
+    // Convert body to string
+    let html = String::from_utf8(index_response.body.into_vec()).expect("Failed to parse HTML");
+
+    // Find the CSS URL in the HTML
+    let css_url = {
+        let css_suffix = "cacheable.css";
+        let css_end = html
+            .find(css_suffix)
+            .expect("Could not find cacheable.css in HTML");
+        let prefix_start = html[..css_end]
+            .rfind('/')
+            .expect("Could not find starting / for CSS URL");
+
+        html[prefix_start..css_end + css_suffix.len()].to_string()
+    };
+
+    // Get CSS file
+    let css_request = HttpRequest {
+        method: "GET".to_string(),
+        url: css_url,
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+
+    let css_response = http_request(&env, canister_id, &css_request)?;
+
+    let css_result = verify_response_certification(
+        &env,
+        canister_id,
+        css_request,
+        css_response.clone(),
+        CERTIFICATION_VERSION,
+    );
+    assert_eq!(css_result.verification_version, CERTIFICATION_VERSION);
+
+    let css_body = String::from_utf8(css_response.body.into_vec()).expect("Failed to parse CSS");
+
+    // Find the Font URL in the CSS
+    let font_url = css_body
+        .lines()
+        .find(|line| line.contains("CircularXXWeb-Regular"))
+        .and_then(|line| {
+            // Extract URL from the line using the pattern: url(/path) format("woff2")
+            if let Some(url_start) = line.find("url(") {
+                let start = url_start + 4; // "url(" is 4 chars
+                if let Some(url_end) = line[start..].find(")") {
+                    let url = line[start..start + url_end].trim_matches(|c| c == '"' || c == '/');
+                    Some(format!("/{}", url))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .expect("Could not find css URL in HTML");
+
+    let font_request = HttpRequest {
+        method: "GET".to_string(),
+        url: font_url,
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+    let font_response = http_request(&env, canister_id, &font_request)?;
+
+    assert_eq!(font_response.status_code, 200);
+    assert!(font_response.headers.contains(&(
+        "Cache-Control".to_string(),
+        "public, max-age=31536000".to_string()
+    )));
+
+    let result = verify_response_certification(
+        &env,
+        canister_id,
+        font_request,
+        font_response,
+        CERTIFICATION_VERSION,
+    );
+    assert_eq!(result.verification_version, CERTIFICATION_VERSION);
+
+    Ok(())
+}
+
+/// Verifies that the cache-control header is set for the SPA file.
+#[test]
+fn should_set_cache_control_for_spa() -> Result<(), CallError> {
+    const CERTIFICATION_VERSION: u16 = 2;
+    let env = env();
+    let canister_id = install_ii_canister(&env, II_WASM.clone());
+
+    // Get index page
+    let index_request = HttpRequest {
+        method: "GET".to_string(),
+        url: "/".to_string(),
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+    let index_response = http_request(&env, canister_id, &index_request)?;
+
+    // Convert body to string
+    let html = String::from_utf8(index_response.body.into_vec()).expect("Failed to parse HTML");
+
+    // Find the SPA URL in the HTML
+    let spa_url = {
+        let spa_suffix = "cacheable.js";
+        let spa_end = html
+            .find(spa_suffix)
+            .expect("Could not find cacheable.js in HTML");
+        let prefix_start = html[..spa_end]
+            .rfind('/')
+            .expect("Could not find starting / for spa URL");
+
+        html[prefix_start..spa_end + spa_suffix.len()].to_string()
+    };
+
+    // Get SPA file
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        url: spa_url,
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+
     let http_response = http_request(&env, canister_id, &request)?;
 
     assert_eq!(http_response.status_code, 200);
     assert!(http_response.headers.contains(&(
         "Cache-Control".to_string(),
-        "public, max-age=604800".to_string()
+        "public, max-age=31536000".to_string()
     )));
 
     let result = verify_response_certification(
@@ -129,7 +402,219 @@ fn should_set_cache_control_for_fonts() -> Result<(), CallError> {
     Ok(())
 }
 
-/// Verifies that all expected metrics are available via the HTTP endpoint.
+/// Verifies that the cache-control header is set for the icons.
+#[test]
+fn should_set_cache_control_for_icons() -> Result<(), CallError> {
+    const CERTIFICATION_VERSION: u16 = 2;
+    let env = env();
+    let canister_id = install_ii_canister(&env, II_WASM.clone());
+
+    // Icon we are testing for
+    const ICON_NAME: &str = "icpswap_logo";
+    const ICON_SUFFIX: &str = ".webp";
+
+    // Get index page
+    let index_request = HttpRequest {
+        method: "GET".to_string(),
+        url: "/".to_string(),
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+    let index_response = http_request(&env, canister_id, &index_request)?;
+
+    // Convert body to string
+    let index_html =
+        String::from_utf8(index_response.body.into_vec()).expect("Failed to parse HTML");
+
+    // Find the SPA URL in the HTML
+    let spa_url = {
+        let spa_suffix = "cacheable.js";
+        let spa_end = index_html
+            .find(spa_suffix)
+            .expect("Could not find cacheable.js in HTML");
+        let prefix_start = index_html[..spa_end]
+            .rfind('/')
+            .expect("Could not find starting / for spa URL");
+
+        index_html[prefix_start..spa_end + spa_suffix.len()].to_string()
+    };
+
+    // Get SPA file
+    let spa_request = HttpRequest {
+        method: "GET".to_string(),
+        url: spa_url,
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+
+    let spa_response = http_request(&env, canister_id, &spa_request)?;
+
+    assert_eq!(spa_response.status_code, 200);
+    assert!(spa_response.headers.contains(&(
+        "Cache-Control".to_string(),
+        "public, max-age=31536000".to_string()
+    )));
+
+    let spa_result = verify_response_certification(
+        &env,
+        canister_id,
+        spa_request,
+        spa_response.clone(),
+        CERTIFICATION_VERSION,
+    );
+    assert_eq!(spa_result.verification_version, CERTIFICATION_VERSION);
+
+    let spa_bytes = spa_response.body.into_vec();
+
+    // Decompress the SPA bytes
+    let mut decoder = GzDecoder::new(&spa_bytes[..]);
+    let mut spa_body = String::new();
+    decoder.read_to_string(&mut spa_body).unwrap();
+
+    // Find the icon URL in the HTML
+    let icon_url = spa_body
+        .lines()
+        .find(|line| line.contains(ICON_NAME))
+        .and_then(|line| {
+            if let Some(url_start) = line.find(&format!("\"/{ICON_NAME}")) {
+                if let Some(url_end) = line[url_start..].find(&format!("{ICON_SUFFIX}\"")) {
+                    let url = line[url_start..url_start + url_end + 5]
+                        .trim_matches(|c| c == '"' || c == '/');
+                    Some(format!("/{}", url))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .expect("Could not find icon URL in HTML");
+
+    let icon_request = HttpRequest {
+        method: "GET".to_string(),
+        url: icon_url,
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+
+    let icon_response = http_request(&env, canister_id, &icon_request)?;
+
+    assert_eq!(icon_response.status_code, 200);
+    assert!(icon_response.headers.contains(&(
+        "Cache-Control".to_string(),
+        "public, max-age=31536000".to_string()
+    )));
+
+    let icon_result = verify_response_certification(
+        &env,
+        canister_id,
+        icon_request,
+        icon_response,
+        CERTIFICATION_VERSION,
+    );
+    assert_eq!(icon_result.verification_version, CERTIFICATION_VERSION);
+
+    Ok(())
+}
+
+#[test]
+fn must_not_cache_well_known_ic_domains() -> Result<(), CallError> {
+    const CERTIFICATION_VERSION: u16 = 2;
+    let env = env();
+    let canister_id = install_ii_canister(&env, II_WASM.clone());
+
+    // Get index page
+    let well_known_request = HttpRequest {
+        method: "GET".to_string(),
+        url: "/.well-known/ic-domains".to_string(),
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+    let well_known_response = http_request(&env, canister_id, &well_known_request)?;
+
+    assert_eq!(well_known_response.status_code, 200);
+    println!("{:?}", well_known_response.headers);
+    assert!(
+        !well_known_response // Make sure we have no cache-control headers whatsoever on the response
+            .headers
+            .clone()
+            .into_iter()
+            .map(|headers| headers.0) // Get only the key
+            .collect::<Vec<String>>()
+            .contains(&"Cache-Control".to_string())
+    );
+
+    let result = verify_response_certification(
+        &env,
+        canister_id,
+        well_known_request,
+        well_known_response,
+        CERTIFICATION_VERSION,
+    );
+    assert_eq!(result.verification_version, CERTIFICATION_VERSION);
+
+    Ok(())
+}
+
+#[test]
+fn must_not_cache_well_known_webauthn() -> Result<(), CallError> {
+    const CERTIFICATION_VERSION: u16 = 2;
+    let env = env();
+    let related_origins: Vec<String> = [
+        "https://identity.internetcomputer.org".to_string(),
+        "https://identity.ic0.app".to_string(),
+    ]
+    .to_vec();
+    let config = InternetIdentityInit {
+        assigned_user_number_range: None,
+        archive_config: None,
+        canister_creation_cycles_cost: None,
+        register_rate_limit: None,
+        captcha_config: None,
+        related_origins: Some(related_origins.clone()),
+        openid_google: None,
+    };
+    let canister_id = install_ii_canister_with_arg(&env, II_WASM.clone(), Some(config));
+
+    // Get index page
+    let well_known_request = HttpRequest {
+        method: "GET".to_string(),
+        url: "/.well-known/webauthn".to_string(),
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(CERTIFICATION_VERSION),
+    };
+    let well_known_response = http_request(&env, canister_id, &well_known_request)?;
+
+    assert_eq!(well_known_response.status_code, 200);
+    println!("{:?}", well_known_response.headers);
+    assert!(
+        !well_known_response // Make sure we have no cache-control headers whatsoever on the response
+            .headers
+            .clone()
+            .into_iter()
+            .map(|headers| headers.0) // Get only the key
+            .collect::<Vec<String>>()
+            .contains(&"Cache-Control".to_string())
+    );
+
+    let result = verify_response_certification(
+        &env,
+        canister_id,
+        well_known_request,
+        well_known_response,
+        CERTIFICATION_VERSION,
+    );
+    assert_eq!(result.verification_version, CERTIFICATION_VERSION);
+
+    Ok(())
+}
+
+/// Verifies that expected metrics are available via the HTTP endpoint.
 #[test]
 fn ii_canister_serves_http_metrics() -> Result<(), CallError> {
     let metrics = vec![
@@ -138,16 +623,19 @@ fn ii_canister_serves_http_metrics() -> Result<(), CallError> {
         "internet_identity_max_user_number",
         "internet_identity_signature_count",
         "internet_identity_stable_memory_pages",
+        "stable_memory_bytes",
+        "internet_identity_heap_pages",
+        "heap_memory_bytes",
         "internet_identity_last_upgrade_timestamp",
         "internet_identity_inflight_challenges",
         "internet_identity_users_in_registration_mode",
         "internet_identity_buffered_archive_entries",
-        "internet_identity_max_num_latest_delegation_origins",
+        "internet_identity_prepare_id_alias_counter",
     ];
     let env = env();
-    env.advance_time(Duration::from_secs(300)); // advance time to see it reflected on the metrics endpoint
+    env.advance_time(Duration::from_secs(300)); // Advance time to see it reflected on the metrics endpoint
 
-    // spawn an archive so that we also get the archive related metrics
+    // Spawn an archive so that we also get the archive related metrics
     let canister_id = install_ii_canister_with_arg(
         &env,
         II_WASM.clone(),
@@ -160,16 +648,35 @@ fn ii_canister_serves_http_metrics() -> Result<(), CallError> {
         let (_, metric_timestamp) = parse_metric(&metrics_body, metric);
         assert_eq!(
             metric_timestamp,
-            env.time(),
+            Duration::from_nanos(time(&env)).as_millis() as u64,
             "metric timestamp did not match state machine time"
         )
     }
     Ok(())
 }
 
-/// Verifies that the metrics list the expected user range.
+/// Verifies that the metrics list the expected user range as configured.
 #[test]
-fn metrics_should_list_expected_user_range() -> Result<(), CallError> {
+fn metrics_should_list_configured_user_range() -> Result<(), CallError> {
+    let env = env();
+    let canister_id = install_ii_canister_with_arg(
+        &env,
+        II_WASM.clone(),
+        arg_with_anchor_range((10_123, 8_188_860)),
+    );
+
+    let metrics = get_metrics(&env, canister_id);
+
+    let (min_user_number, _) = parse_metric(&metrics, "internet_identity_min_user_number");
+    let (max_user_number, _) = parse_metric(&metrics, "internet_identity_max_user_number");
+    assert_eq!(min_user_number, 10_123f64);
+    assert_eq!(max_user_number, 8_188_859f64);
+    Ok(())
+}
+
+/// Verifies that the metrics list the default user range if none is configured.
+#[test]
+fn metrics_should_list_default_user_range() -> Result<(), CallError> {
     let env = env();
     let canister_id = install_ii_canister(&env, II_WASM.clone());
 
@@ -178,7 +685,7 @@ fn metrics_should_list_expected_user_range() -> Result<(), CallError> {
     let (min_user_number, _) = parse_metric(&metrics, "internet_identity_min_user_number");
     let (max_user_number, _) = parse_metric(&metrics, "internet_identity_max_user_number");
     assert_eq!(min_user_number, 10_000f64);
-    assert_eq!(max_user_number, 8_188_859f64);
+    assert_eq!(max_user_number, 67_116_815f64);
     Ok(())
 }
 
@@ -273,18 +780,15 @@ fn metrics_stable_memory_pages_should_increase_with_more_users() -> Result<(), C
     let canister_id = install_ii_canister(&env, II_WASM.clone());
 
     let metrics = get_metrics(&env, canister_id);
-    let (stable_memory_pages, _) = parse_metric(&metrics, "internet_identity_stable_memory_pages");
-    // empty II has some metadata in stable memory which requires two pages:
-    // one page for the header, and one for the memory manager.
-    assert_eq!(stable_memory_pages, 2f64);
+    let (initial_memory_pages, _) = parse_metric(&metrics, "internet_identity_stable_memory_pages");
 
     // the anchor offset is 2 pages -> adding a single anchor increases stable memory usage by
-    // one bucket (ie. 128 pages) allocated by the memory manager.
+    // one bucket (i.e. 128 pages) allocated by the memory manager.
     flows::register_anchor(&env, canister_id);
 
     let metrics = get_metrics(&env, canister_id);
-    let (stable_memory_pages, _) = parse_metric(&metrics, "internet_identity_stable_memory_pages");
-    assert_eq!(stable_memory_pages, 130f64);
+    let (pages_with_users, _) = parse_metric(&metrics, "internet_identity_stable_memory_pages");
+    assert!(initial_memory_pages < pages_with_users);
     Ok(())
 }
 
@@ -299,7 +803,7 @@ fn metrics_last_upgrade_timestamp_should_update_after_upgrade() -> Result<(), Ca
     assert_metric(
         &get_metrics(&env, canister_id),
         "internet_identity_last_upgrade_timestamp",
-        env.time().duration_since(UNIX_EPOCH).unwrap().as_nanos() as f64,
+        time(&env) as f64,
     );
 
     env.advance_time(Duration::from_secs(300)); // the state machine does not advance time on its own
@@ -308,7 +812,7 @@ fn metrics_last_upgrade_timestamp_should_update_after_upgrade() -> Result<(), Ca
     assert_metric(
         &get_metrics(&env, canister_id),
         "internet_identity_last_upgrade_timestamp",
-        env.time().duration_since(UNIX_EPOCH).unwrap().as_nanos() as f64,
+        time(&env) as f64,
     );
     Ok(())
 }
@@ -464,8 +968,339 @@ fn metrics_anchor_operations() -> Result<(), CallError> {
     Ok(())
 }
 
+#[test]
+fn should_list_virtual_memory_metrics() -> Result<(), CallError> {
+    let env = env();
+    let canister_id = install_ii_canister(&env, II_WASM.clone());
+
+    let metrics = get_metrics(&env, canister_id);
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"header\"}",
+        1f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"identities\"}",
+        0f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"archive_buffer\"}",
+        1f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"event_data\"}",
+        1f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"event_aggregations\"}",
+        1f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"reference_registration_rate\"}",
+        1f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"current_registration_rate\"}",
+        1f64,
+    );
+
+    let authn_method = test_authn_method();
+    create_identity_with_authn_method(&env, canister_id, &authn_method);
+
+    let metrics = get_metrics(&env, canister_id);
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"header\"}",
+        1f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_virtual_memory_size_pages{memory=\"identities\"}",
+        1f64,
+    );
+
+    // To test the archive buffer and event data related memory metrics growing,
+    // we would have a very complex setup and require a large number of request.
+    // Or load a prepared state with a large number of entries.
+    // This is not done here, as it would either require brittle setup or a long-running test.
+
+    Ok(())
+}
+
+#[test]
+fn should_list_aggregated_session_seconds_and_event_data_counters() -> Result<(), CallError> {
+    let pub_session_key = ByteBuf::from("session public key");
+    let authn_method_ic0 = AuthnMethodData {
+        metadata: HashMap::from([(
+            "origin".to_string(),
+            MetadataEntryV2::String("https://identity.ic0.app".to_string()),
+        )]),
+        ..sample_pubkey_authn_method(1)
+    };
+    let authn_method_internetcomputer = AuthnMethodData {
+        metadata: HashMap::from([(
+            "origin".to_string(),
+            MetadataEntryV2::String("https://identity.internetcomputer.org".to_string()),
+        )]),
+        ..sample_pubkey_authn_method(2)
+    };
+
+    let env = env();
+    let canister_id = install_ii_canister(&env, II_WASM.clone());
+    let user_number_1 = create_identity_with_authn_methods(
+        &env,
+        canister_id,
+        &[
+            test_authn_method(),
+            authn_method_ic0.clone(),
+            authn_method_internetcomputer.clone(),
+        ],
+    );
+
+    let metrics = get_metrics(&env, canister_id);
+    // make sure empty data is not listed on the metrics endpoint
+    assert!(!metrics.contains("internet_identity_prepare_delegation_session_seconds{"));
+    assert_metric(
+        &get_metrics(&env, canister_id),
+        "internet_identity_event_data_count",
+        0f64,
+    );
+    assert_metric(
+        &get_metrics(&env, canister_id),
+        "internet_identity_event_aggregations_count",
+        0f64,
+    );
+
+    api::prepare_delegation(
+        &env,
+        canister_id,
+        test_authn_method().principal(),
+        user_number_1,
+        "https://some-dapp-1.com",
+        &pub_session_key,
+        None,
+    )?;
+    api::prepare_delegation(
+        &env,
+        canister_id,
+        authn_method_ic0.principal(),
+        user_number_1,
+        "https://some-dapp-2.com",
+        &pub_session_key,
+        Some(Duration::from_secs(3600).as_nanos() as u64),
+    )?;
+    api::prepare_delegation(
+        &env,
+        canister_id,
+        authn_method_ic0.principal(),
+        user_number_1,
+        "https://some-dapp-2.com",
+        &pub_session_key,
+        None,
+    )?;
+    api::prepare_delegation(
+        &env,
+        canister_id,
+        authn_method_internetcomputer.principal(),
+        user_number_1,
+        "https://some-dapp-3.com",
+        &pub_session_key,
+        None,
+    )?;
+
+    let metrics = get_metrics(&env, canister_id);
+    assert_metric(
+        &metrics,
+        "internet_identity_prepare_delegation_session_seconds{dapp=\"https://some-dapp-2.com\",window=\"24h\",ii_origin=\"ic0.app\"}",
+        5400f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_prepare_delegation_count{dapp=\"https://some-dapp-2.com\",window=\"24h\",ii_origin=\"ic0.app\"}",
+        2f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_prepare_delegation_session_seconds{dapp=\"https://some-dapp-2.com\",window=\"30d\",ii_origin=\"ic0.app\"}",
+        5400f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_prepare_delegation_count{dapp=\"https://some-dapp-2.com\",window=\"30d\",ii_origin=\"ic0.app\"}",
+        2f64,
+    );
+    assert_metric(
+        &get_metrics(&env, canister_id),
+        "internet_identity_event_data_count",
+        4f64,
+    );
+    assert_metric(
+        &get_metrics(&env, canister_id),
+        "internet_identity_event_aggregations_count",
+        12f64,
+    );
+    // make sure aggregations for other II domains are not listed on the metrics endpoint
+    assert!(
+        !metrics.contains(
+            "internet_identity_prepare_delegation_session_seconds{dapp=\"https://some-dapp-1.com\",window=\"24h\""));
+    assert!(
+        !metrics.contains(
+            "internet_identity_prepare_delegation_session_seconds{dapp=\"https://some-dapp-3.com\",window=\"24h\""));
+    assert!(!metrics.contains("ii_origin=\"other\""));
+    assert!(!metrics.contains("ii_origin=\"internetcomputer.org\""));
+
+    // advance time one day to see it reflected on the daily stats
+    env.advance_time(Duration::from_secs(60 * 60 * 24));
+    // call prepare delegation again to trigger stats update
+    api::prepare_delegation(
+        &env,
+        canister_id,
+        authn_method_internetcomputer.principal(),
+        user_number_1,
+        "https://some-dapp-4.com",
+        &pub_session_key,
+        None,
+    )?;
+
+    let metrics = get_metrics(&env, canister_id);
+    // The 24h metrics should be gone now
+    assert!(
+        !metrics.contains(
+            "internet_identity_prepare_delegation_session_seconds{dapp=\"https://some-dapp-2.com\",window=\"24h\""));
+    assert!(
+        !metrics.contains(
+            "internet_identity_prepare_delegation_count{dapp=\"https://some-dapp-2.com\",window=\"24h\""));
+
+    // The 30d metrics should still be there
+    assert_metric(
+        &metrics,
+        "internet_identity_prepare_delegation_session_seconds{dapp=\"https://some-dapp-2.com\",window=\"30d\",ii_origin=\"ic0.app\"}",
+        5400f64,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_prepare_delegation_count{dapp=\"https://some-dapp-2.com\",window=\"30d\",ii_origin=\"ic0.app\"}",
+        2f64,
+    );
+    assert_metric(
+        &get_metrics(&env, canister_id),
+        "internet_identity_event_data_count",
+        5f64,
+    );
+    assert_metric(
+        &get_metrics(&env, canister_id),
+        "internet_identity_event_aggregations_count",
+        10f64,
+    );
+    Ok(())
+}
+
+#[test]
+fn should_list_prepare_id_alias_counter() -> Result<(), CallError> {
+    let env = env();
+    let canister_id = install_ii_canister(&env, II_WASM.clone());
+    let identity_number = flows::register_anchor(&env, canister_id);
+
+    let prepare_id_alias_req = PrepareIdAliasRequest {
+        identity_number,
+        relying_party: FrontendHostname::from("https://some-dapp.com"),
+        issuer: FrontendHostname::from("https://some-issuer-1.com"),
+    };
+
+    for _ in 0..3 {
+        api::vc_mvp::prepare_id_alias(
+            &env,
+            canister_id,
+            principal_1(),
+            prepare_id_alias_req.clone(),
+        )?
+        .expect("Got 'None' from prepare_id_alias");
+    }
+
+    assert_metric(
+        &get_metrics(&env, canister_id),
+        "internet_identity_prepare_id_alias_counter",
+        3f64,
+    );
+    Ok(())
+}
+
+#[test]
+fn should_report_registration_rates() -> Result<(), CallError> {
+    let env = env();
+    let canister_id = install_ii_canister_with_arg(
+        &env,
+        II_WASM.clone(),
+        Some(InternetIdentityInit {
+            captcha_config: Some(CaptchaConfig {
+                max_unsolved_captchas: 500,
+                captcha_trigger: CaptchaTrigger::Dynamic {
+                    threshold_pct: 20,
+                    current_rate_sampling_interval_s: 10,
+                    reference_rate_sampling_interval_s: 100,
+                },
+            }),
+            ..InternetIdentityInit::default()
+        }),
+    );
+
+    let metrics = get_metrics(&env, canister_id);
+    assert_metric(
+        &metrics,
+        "internet_identity_registrations_per_second{type=\"reference_rate\"}",
+        0.0,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_registrations_per_second{type=\"current_rate\"}",
+        0.0,
+    );
+    assert_metric(
+        &metrics,
+        "internet_identity_registrations_per_second{type=\"captcha_threshold_rate\"}",
+        0.0,
+    );
+
+    for _ in 0..20 {
+        // make sure both registration flows are counted
+        flows::register_anchor(&env, canister_id); // legacy API
+        create_identity_with_authn_method(&env, canister_id, &test_authn_method()); // v2 API
+        env.advance_time(Duration::from_secs(1));
+    }
+
+    // advance time a little further to make reference rate be different from the current rate
+    env.advance_time(Duration::from_secs(5));
+    env.tick(); // tick for the advance time to become effective
+    let metrics = get_metrics(&env, canister_id);
+    assert_metric_approx(
+        &metrics,
+        "internet_identity_registrations_per_second{type=\"reference_rate\"}",
+        0.4,
+        0.1,
+    );
+    assert_metric_approx(
+        &metrics,
+        "internet_identity_registrations_per_second{type=\"current_rate\"}",
+        2f64,
+        0.1,
+    );
+    assert_metric_approx(
+        &metrics,
+        "internet_identity_registrations_per_second{type=\"captcha_threshold_rate\"}",
+        0.48,
+        0.1,
+    );
+    Ok(())
+}
+
 fn verify_response_certification(
-    env: &StateMachine,
+    env: &PocketIc,
     canister_id: CanisterId,
     request: HttpRequest,
     http_response: HttpResponse,
@@ -482,11 +1317,12 @@ fn verify_response_certification(
             status_code: http_response.status_code,
             headers: http_response.headers,
             body: http_response.body.into_vec(),
+            upgrade: None,
         },
         canister_id.as_slice(),
         time(env) as u128,
         Duration::from_secs(300).as_nanos(),
-        &env.root_key(),
+        &env.root_key().unwrap(),
         min_certification_version as u8,
     )
     .unwrap_or_else(|e| panic!("validation failed: {e}"))

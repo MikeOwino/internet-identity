@@ -2,45 +2,48 @@
 
 use assert_matches::assert_matches;
 use candid::{CandidType, Deserialize, Principal};
-use canister_sig_util::{extract_raw_root_pk_from_der, CanisterSigPublicKey};
 use canister_tests::api::http_request;
 use canister_tests::api::internet_identity::vc_mvp as ii_api;
 use canister_tests::flows;
 use canister_tests::framework::{env, get_wasm_path, principal_1, test_principal, time, II_WASM};
+use ic_canister_sig_creation::{
+    extract_raw_root_pk_from_der, CanisterSigPublicKey, IC_ROOT_PK_DER,
+};
 use ic_cdk::api::management_canister::provisional::CanisterId;
 use ic_response_verification::types::VerificationInfo;
 use ic_response_verification::verify_request_response_pair;
-use ic_test_state_machine_client::{call_candid, call_candid_as};
-use ic_test_state_machine_client::{query_candid_as, CallError, StateMachine};
-use identity_core::common::Value;
-use identity_jose::jwt::JwtClaims;
+use ic_verifiable_credentials::issuer_api::{
+    ArgumentValue, CredentialSpec, DerivationOriginData, DerivationOriginError,
+    DerivationOriginRequest, GetCredentialRequest, Icrc21ConsentInfo, Icrc21ConsentPreferences,
+    Icrc21Error, Icrc21VcConsentMessageRequest, IssueCredentialError, IssuedCredentialData,
+    PrepareCredentialRequest, PreparedCredentialData, SignedIdAlias as SignedIssuerIdAlias,
+};
+use ic_verifiable_credentials::{
+    get_verified_id_alias_from_jws, validate_claims_match_spec,
+    verify_credential_jws_with_canister_id,
+};
 use internet_identity_interface::http_gateway::{HttpRequest, HttpResponse};
 use internet_identity_interface::internet_identity::types::vc_mvp::{
     GetIdAliasRequest, PrepareIdAliasRequest,
 };
 use internet_identity_interface::internet_identity::types::FrontendHostname;
 use lazy_static::lazy_static;
+use pocket_ic::{call_candid, call_candid_as};
+use pocket_ic::{query_candid_as, CallError, PocketIc};
 use serde_bytes::ByteBuf;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, UNIX_EPOCH};
-use vc_util::issuer_api::{
-    ArgumentValue, CredentialSpec, GetCredentialRequest, Icrc21ConsentInfo,
-    Icrc21ConsentPreferences, Icrc21Error, Icrc21VcConsentMessageRequest, IssueCredentialError,
-    IssuedCredentialData, PrepareCredentialRequest, PreparedCredentialData,
-    SignedIdAlias as SignedIssuerIdAlias,
-};
-use vc_util::{
-    did_for_principal, get_verified_id_alias_from_jws, verify_credential_jws_with_canister_id,
-};
+use std::time::Duration;
 
 const DUMMY_ROOT_KEY: &str ="308182301d060d2b0601040182dc7c0503010201060c2b0601040182dc7c05030201036100adf65638a53056b2222c91bb2457b0274bca95198a5acbdadfe7fd72178f069bdea8d99e9479d8087a2686fc81bf3c4b11fe275570d481f1698f79d468afe0e57acc1e298f8b69798da7a891bbec197093ec5f475909923d48bfed6843dbed1f";
 const DUMMY_II_CANISTER_ID: &str = "rwlgt-iiaaa-aaaaa-aaaaa-cai";
+const DUMMY_DERIVATION_ORIGIN: &str = "https://y2aaj-miaaa-aaaad-aacxq-cai.ic0.app";
+const DUMMY_FRONTEND_HOSTNAME: &str = "https://y2aaj-miaaa-aaaad-aacxq-cai.ic0.app";
 
 /// Dummy alias JWS for testing, valid wrt DUMMY_ROOT_KEY and DUMMY_II_CANISTER_ID.
 /// id dapp: nugva-s7c6v-4yszt-koycv-5b623-an7q6-ha2nz-kz6rs-hawgl-nznbe-rqe
-/// id alias: vhbib-m4hm6-hpvyc-7prd2-siivo-nbd7r-67o5x-n3awh-qsmqz-wznjf-tqe
-const DUMMY_ALIAS_JWS: &str ="eyJqd2siOnsia3R5Ijoib2N0IiwiYWxnIjoiSWNDcyIsImsiOiJNRHd3REFZS0t3WUJCQUdEdUVNQkFnTXNBQW9BQUFBQUFBQUFBQUVCRVNzWHp2bTEzd1BkRTVZSndvLTBCYkdBTHdCN0J2bW1LZUxramFUUTdkQSJ9LCJraWQiOiJkaWQ6aWNwOnJ3bGd0LWlpYWFhLWFhYWFhLWFhYWFhLWNhaSIsImFsZyI6IkljQ3MifQ.eyJleHAiOjE2MjAzMjk1MzAsImlzcyI6Imh0dHBzOi8vaWRlbnRpdHkuaWMwLmFwcC8iLCJuYmYiOjE2MjAzMjg2MzAsImp0aSI6Imh0dHBzOi8vaWRlbnRpdHkuaWMwLmFwcC9jcmVkZW50aWFsLzE2MjAzMjg2MzAwMDAwMDAwMDAiLCJzdWIiOiJkaWQ6aWNwOm51Z3ZhLXM3YzZ2LTR5c3p0LWtveWN2LTViNjIzLWFuN3E2LWhhMm56LWt6NnJzLWhhd2dsLW56bmJlLXJxZSIsInZjIjp7IkBjb250ZXh0IjoiaHR0cHM6Ly93d3cudzMub3JnLzIwMTgvY3JlZGVudGlhbHMvdjEiLCJ0eXBlIjpbIlZlcmlmaWFibGVDcmVkZW50aWFsIiwiSW50ZXJuZXRJZGVudGl0eUlkQWxpYXMiXSwiY3JlZGVudGlhbFN1YmplY3QiOnsiaGFzX2lkX2FsaWFzIjoiZGlkOmljcDp2aGJpYi1tNGhtNi1ocHZ5Yy03cHJkMi1zaWl2by1uYmQ3ci02N281eC1uM2F3aC1xc21xei13em5qZi10cWUifX19.2dn3omtjZXJ0aWZpY2F0ZVkBsdnZ96JkdHJlZYMBgwGDAYMCSGNhbmlzdGVygwGDAkoAAAAAAAAAAAEBgwGDAYMBgwJOY2VydGlmaWVkX2RhdGGCA1ggnk2d-80NLXpxOs-YszCLd4yvrGBtLEGqe6rp6khNthCCBFgg0sz_P8xdqTDewOhKJUHmWFFrS7FQHnDotBDmmGoFfWCCBFggaAMB9TDaAhXeQPY8DCCUq90vqJJDqpDAVwU-0WdA9OmCBFgghh7VsiTOqTlAiY8hcsbF1pFnG5t1x4kQ7rt2bae_6iGCBFgggcqzMKDpDQKcyRl6xrGy4SIYEtgVJgSLlHGFvHN6zuSCBFggBNxwNVuf0_gTaiM6hbpNNCcEIBfxLHoor0N1mpX-uNeCBFggICEcda6JC5WRFIbzoGGJdJINoas-EWtoCU0lysCe3OGDAYIEWCA1U_ZYHVOz3Sdkb2HIsNoLDDiBuFfG3DxH6miIwRPra4MCRHRpbWWCA0mAuK7U3YmkvhZpc2lnbmF0dXJlWDCY_kVxXw7Wk8HlA0FqOpX-3WMdI0mmxAtY9DJv8xEkfitcTOR0FcE412IftkdH48hkdHJlZYMBggRYIPKxlnFAySvK4ahA_Q0IkEopYPh8H4_IRCFRGb2i23QRgwJDc2lngwJYIFcsa4eb-HMrTnmGWNje_RfErQYi0wNCJvGDrzqazq0OgwGCBFggg7ijRBePgPVau7zffNEvAXThew-FqcBH_cB-fF7722eDAlgg3ikzXLDphmWB8YbAxZDjZfLFd6bDS-sLAPzmVj0nlvSCA0A";
+/// id alias: jkk22-zqdxc-kgpez-6sv2m-5pby4-wi4t2-prmoq-gf2ih-i2qtc-v37ac-5ae
+const DUMMY_ALIAS_JWS: &str ="eyJqd2siOnsia3R5Ijoib2N0IiwiYWxnIjoiSWNDcyIsImsiOiJNRHd3REFZS0t3WUJCQUdEdUVNQkFnTXNBQW9BQUFBQUFBQUFBQUVCMGd6TTVJeXFMYUhyMDhtQTRWd2J5SmRxQTFyRVFUX2xNQnVVbmN5UDVVYyJ9LCJraWQiOiJkaWQ6aWNwOnJ3bGd0LWlpYWFhLWFhYWFhLWFhYWFhLWNhaSIsImFsZyI6IkljQ3MifQ.eyJleHAiOjE2MjAzMjk1MzAsImlzcyI6Imh0dHBzOi8vaWRlbnRpdHkuaWMwLmFwcC8iLCJuYmYiOjE2MjAzMjg2MzAsImp0aSI6ImRhdGE6dGV4dC9wbGFpbjtjaGFyc2V0PVVURi04LHRpbWVzdGFtcF9uczoxNjIwMzI4NjMwMDAwMDAwMDAwLGFsaWFzX2hhc2g6YTI3YzU4NTQ0MmUwN2RkZWFkZTRjNWE0YTAzMjdkMzA4NTE5NDAzYzRlYTM3NDIxNzBhZTRkYzk1YjIyZTQ3MyIsInN1YiI6ImRpZDppY3A6bnVndmEtczdjNnYtNHlzenQta295Y3YtNWI2MjMtYW43cTYtaGEybnota3o2cnMtaGF3Z2wtbnpuYmUtcnFlIiwidmMiOnsiQGNvbnRleHQiOiJodHRwczovL3d3dy53My5vcmcvMjAxOC9jcmVkZW50aWFscy92MSIsInR5cGUiOlsiVmVyaWZpYWJsZUNyZWRlbnRpYWwiLCJJbnRlcm5ldElkZW50aXR5SWRBbGlhcyJdLCJjcmVkZW50aWFsU3ViamVjdCI6eyJJbnRlcm5ldElkZW50aXR5SWRBbGlhcyI6eyJoYXNJZEFsaWFzIjoiamtrMjItenFkeGMta2dwZXotNnN2Mm0tNXBieTQtd2k0dDItcHJtb3EtZ2YyaWgtaTJxdGMtdjM3YWMtNWFlIn19fX0.2dn3omtjZXJ0aWZpY2F0ZVkBsdnZ96JkdHJlZYMBgwGDAYMCSGNhbmlzdGVygwGDAkoAAAAAAAAAAAEBgwGDAYMBgwJOY2VydGlmaWVkX2RhdGGCA1ggvlJBTZDgK1_9Vb3-18dWKIfy28WTjZ1YqdjFWWAIX96CBFgg0sz_P8xdqTDewOhKJUHmWFFrS7FQHnDotBDmmGoFfWCCBFgg_KZ0TVqubo_EGWoMUPA35BYZ4B5ZRkR_zDfNIQCwa46CBFggj_ZV-7o59iVEjztzZtpNnO9YC7GjbKmg2eDtJzGz1weCBFggXAzCWvb9h4qsVs41IUJBABzjSqAZ8DIzF_ghGHpGmHGCBFggJhbsbvKYt7rjLK5SI0NDc600o-ajSYQNuOXps6qUrdiCBFggBFQwZetJeY_gx6TQohTqUOskblddajS20DA0esxWoyWDAYIEWCA1U_ZYHVOz3Sdkb2HIsNoLDDiBuFfG3DxH6miIwRPra4MCRHRpbWWCA0mAuK7U3YmkvhZpc2lnbmF0dXJlWDC5cq4UxYy7cnkcw6yv5SCh4POY9u0iHecZuxO8E9oxIqXRdHmnYVF0Fv_R-aws0EBkdHJlZYMBggRYIOGnlc_3yXPTVrEJ1p3dKX5HxkMOziUnpA1HeXiQW4O8gwJDc2lngwJYIIOQR7wl3Ws9Jb8VP4rhIb37XKLMkkZ2P7WaZ5we60WGgwGCBFgg21-OewBgqt_-0AtHHHS4yPyQK9g6JTHaGUuSIw4QYgqDAlgg5bQnHHvS3FfM_BaiSL6n19qoXkuA1KoLWk963fOUMW-CA0A";
 const DUMMY_ALIAS_ID_DAPP_PRINCIPAL: &str =
     "nugva-s7c6v-4yszt-koycv-5b623-an7q6-ha2nz-kz6rs-hawgl-nznbe-rqe";
 
@@ -59,8 +62,10 @@ lazy_static! {
     };
 
     pub static ref DUMMY_ISSUER_INIT: IssuerInit = IssuerInit {
-        ic_root_key_der: hex::decode(DUMMY_ROOT_KEY).unwrap(),
+        ic_root_key_der: Some(hex::decode(DUMMY_ROOT_KEY).unwrap()),
         idp_canister_ids: vec![Principal::from_text(DUMMY_II_CANISTER_ID).unwrap()],
+        derivation_origin: DUMMY_DERIVATION_ORIGIN.to_string(),
+        frontend_hostname: DUMMY_FRONTEND_HOSTNAME.to_string(),
     };
 
     pub static ref DUMMY_SIGNED_ID_ALIAS: SignedIssuerIdAlias = SignedIssuerIdAlias {
@@ -68,23 +73,35 @@ lazy_static! {
     };
 }
 
-pub fn install_canister(env: &StateMachine, wasm: Vec<u8>) -> CanisterId {
-    let canister_id = env.create_canister(None);
+pub fn install_canister_as(
+    env: &PocketIc,
+    wasm: Vec<u8>,
+    controller: Option<Principal>,
+) -> CanisterId {
+    let canister_id = env.create_canister_with_settings(controller, None);
     let arg = candid::encode_one("()").expect("error encoding II installation arg as candid");
-    env.install_canister(canister_id, wasm, arg, None);
+    env.install_canister(canister_id, wasm, arg, controller);
     canister_id
+}
+
+pub fn install_canister(env: &PocketIc, wasm: Vec<u8>) -> CanisterId {
+    install_canister_as(env, wasm, None)
 }
 
 #[derive(CandidType, Deserialize)]
 pub struct IssuerInit {
     /// Root of trust for checking canister signatures.
-    ic_root_key_der: Vec<u8>,
+    ic_root_key_der: Option<Vec<u8>>,
     /// List of canister ids that are allowed to provide id alias credentials.
     idp_canister_ids: Vec<Principal>,
+    /// The derivation origin to be used by the issuer.
+    derivation_origin: String,
+    /// Frontend hostname be used by the issuer.
+    frontend_hostname: String,
 }
 
-pub fn install_issuer(env: &StateMachine, init: &IssuerInit) -> CanisterId {
-    let canister_id = env.create_canister(None);
+pub fn install_issuer(env: &PocketIc, init: &IssuerInit) -> CanisterId {
+    let canister_id = env.create_canister();
     let arg = candid::encode_one(Some(init)).expect("error encoding II installation arg as candid");
     env.install_canister(canister_id, VC_ISSUER_WASM.clone(), arg, None);
     canister_id
@@ -92,17 +109,24 @@ pub fn install_issuer(env: &StateMachine, init: &IssuerInit) -> CanisterId {
 
 mod api {
     use super::*;
+    use pocket_ic::common::rest::RawEffectivePrincipal;
 
     pub fn configure(
-        env: &StateMachine,
+        env: &PocketIc,
         canister_id: CanisterId,
         config: &IssuerInit,
     ) -> Result<(), CallError> {
-        call_candid(env, canister_id, "configure", (config,))
+        call_candid(
+            env,
+            canister_id,
+            RawEffectivePrincipal::None,
+            "configure",
+            (config,),
+        )
     }
 
     pub fn vc_consent_message(
-        env: &StateMachine,
+        env: &PocketIc,
         canister_id: CanisterId,
         sender: Principal,
         consent_message_request: &Icrc21VcConsentMessageRequest,
@@ -110,6 +134,7 @@ mod api {
         call_candid_as(
             env,
             canister_id,
+            RawEffectivePrincipal::None,
             sender,
             "vc_consent_message",
             (consent_message_request,),
@@ -117,32 +142,97 @@ mod api {
         .map(|(x,)| x)
     }
 
+    pub fn derivation_origin(
+        env: &PocketIc,
+        canister_id: CanisterId,
+        derivation_origin_req: &DerivationOriginRequest,
+    ) -> Result<Result<DerivationOriginData, DerivationOriginError>, CallError> {
+        call_candid(
+            env,
+            canister_id,
+            RawEffectivePrincipal::None,
+            "derivation_origin",
+            (derivation_origin_req,),
+        )
+        .map(|(x,)| x)
+    }
+
+    pub fn set_derivation_origin(
+        env: &PocketIc,
+        canister_id: CanisterId,
+        frontend_hostname: &str,
+        derivation_origin: &str,
+    ) -> Result<(), CallError> {
+        call_candid(
+            env,
+            canister_id,
+            RawEffectivePrincipal::None,
+            "set_derivation_origin",
+            (frontend_hostname, derivation_origin),
+        )
+    }
+
+    pub fn set_alternative_origins(
+        env: &PocketIc,
+        canister_id: CanisterId,
+        alternative_origins: &str,
+    ) -> Result<(), CallError> {
+        call_candid(
+            env,
+            canister_id,
+            RawEffectivePrincipal::None,
+            "set_alternative_origins",
+            (alternative_origins,),
+        )
+    }
+
     pub fn add_employee(
-        env: &StateMachine,
+        env: &PocketIc,
         canister_id: CanisterId,
         employee_id: Principal,
     ) -> Result<String, CallError> {
-        call_candid(env, canister_id, "add_employee", (employee_id,)).map(|(x,)| x)
+        call_candid(
+            env,
+            canister_id,
+            RawEffectivePrincipal::None,
+            "add_employee",
+            (employee_id,),
+        )
+        .map(|(x,)| x)
     }
 
     pub fn add_graduate(
-        env: &StateMachine,
+        env: &PocketIc,
         canister_id: CanisterId,
         graduate_id: Principal,
     ) -> Result<String, CallError> {
-        call_candid(env, canister_id, "add_graduate", (graduate_id,)).map(|(x,)| x)
+        call_candid(
+            env,
+            canister_id,
+            RawEffectivePrincipal::None,
+            "add_graduate",
+            (graduate_id,),
+        )
+        .map(|(x,)| x)
     }
 
     pub fn add_adult(
-        env: &StateMachine,
+        env: &PocketIc,
         canister_id: CanisterId,
         adult_id: Principal,
     ) -> Result<String, CallError> {
-        call_candid(env, canister_id, "add_adult", (adult_id,)).map(|(x,)| x)
+        call_candid(
+            env,
+            canister_id,
+            RawEffectivePrincipal::None,
+            "add_adult",
+            (adult_id,),
+        )
+        .map(|(x,)| x)
     }
 
     pub fn prepare_credential(
-        env: &StateMachine,
+        env: &PocketIc,
         canister_id: CanisterId,
         sender: Principal,
         prepare_credential_request: &PrepareCredentialRequest,
@@ -150,6 +240,7 @@ mod api {
         call_candid_as(
             env,
             canister_id,
+            RawEffectivePrincipal::None,
             sender,
             "prepare_credential",
             (prepare_credential_request,),
@@ -158,7 +249,7 @@ mod api {
     }
 
     pub fn get_credential(
-        env: &StateMachine,
+        env: &PocketIc,
         canister_id: CanisterId,
         sender: Principal,
         get_credential_request: &GetCredentialRequest,
@@ -225,7 +316,7 @@ fn should_return_vc_consent_message_for_adult_vc() {
 
     for (requested_language, actual_language, consent_message_snippet) in test_cases {
         let mut args = HashMap::new();
-        args.insert("age_at_least".to_string(), ArgumentValue::Int(18));
+        args.insert("minAge".to_string(), ArgumentValue::Int(18));
         let consent_message_request = Icrc21VcConsentMessageRequest {
             credential_spec: CredentialSpec {
                 credential_type: "VerifiedAdult".to_string(),
@@ -313,6 +404,69 @@ fn should_fail_vc_consent_message_if_missing_required_argument() {
     assert_matches!(response, Err(Icrc21Error::UnsupportedCanisterCall(_)));
 }
 
+#[test]
+fn should_return_derivation_origin() {
+    let env = env();
+    let canister_id = install_canister(&env, VC_ISSUER_WASM.clone());
+    let frontend_hostname = format!("https://{}.icp0.io", canister_id.to_text());
+    let req = DerivationOriginRequest { frontend_hostname };
+    let response = api::derivation_origin(&env, canister_id, &req)
+        .expect("API call failed")
+        .expect("derivation_origin error");
+    assert_eq!(response.origin, req.frontend_hostname);
+}
+
+#[test]
+fn should_set_derivation_origin() {
+    let env = env();
+    let canister_id = install_canister(&env, VC_ISSUER_WASM.clone());
+    let req = DerivationOriginRequest {
+        frontend_hostname: "frontend_hostname.com".to_string(),
+    };
+
+    let response = api::derivation_origin(&env, canister_id, &req)
+        .expect("API call failed")
+        .expect("derivation_origin error");
+    let default_derivation_origin = format!("https://{}.icp0.io", canister_id.to_text());
+    assert_eq!(response.origin, default_derivation_origin);
+
+    let derivation_origin = "https://derivation.origin";
+    api::set_derivation_origin(
+        &env,
+        canister_id,
+        "frontend_hostname.com".to_string().as_str(),
+        derivation_origin,
+    )
+    .expect("failed to set derivation_origin");
+
+    let response = api::derivation_origin(&env, canister_id, &req)
+        .expect("API call failed")
+        .expect("derivation_origin error");
+    assert_eq!(response.origin, derivation_origin);
+}
+
+#[test]
+fn should_return_derivation_origin_with_custom_init() {
+    let env = env();
+    let custom_init = IssuerInit {
+        ic_root_key_der: Some(hex::decode(DUMMY_ROOT_KEY).unwrap()),
+        idp_canister_ids: vec![Principal::from_text(DUMMY_II_CANISTER_ID).unwrap()],
+        derivation_origin: "https://derivation_origin".to_string(),
+        frontend_hostname: "https://frontend.host.name".to_string(),
+    };
+    let issuer_id = install_issuer(&env, &custom_init);
+    let response = api::derivation_origin(
+        &env,
+        issuer_id,
+        &DerivationOriginRequest {
+            frontend_hostname: custom_init.frontend_hostname.clone(),
+        },
+    )
+    .expect("API call failed")
+    .expect("derivation_origin error");
+    assert_eq!(response.origin, custom_init.derivation_origin);
+}
+
 fn employee_credential_spec() -> CredentialSpec {
     let mut args = HashMap::new();
     args.insert(
@@ -339,7 +493,7 @@ fn degree_credential_spec() -> CredentialSpec {
 
 fn adult_credential_spec() -> CredentialSpec {
     let mut args = HashMap::new();
-    args.insert("age_at_least".to_string(), ArgumentValue::Int(18));
+    args.insert("minAge".to_string(), ArgumentValue::Int(18));
     CredentialSpec {
         credential_type: "VerifiedAdult".to_string(),
         arguments: Some(args),
@@ -446,8 +600,10 @@ fn should_fail_prepare_credential_for_wrong_root_key() {
     let issuer_id = install_issuer(
         &env,
         &IssuerInit {
-            ic_root_key_der: canister_sig_util::IC_ROOT_PK_DER.to_vec(), // does not match the DUMMY_ROOT_KEY, which is used in DUMMY_ALIAS_JWS
+            ic_root_key_der: Some(IC_ROOT_PK_DER.to_vec()), // does not match the DUMMY_ROOT_KEY, which is used in DUMMY_ALIAS_JWS
             idp_canister_ids: vec![Principal::from_text(DUMMY_II_CANISTER_ID).unwrap()],
+            derivation_origin: DUMMY_DERIVATION_ORIGIN.to_string(),
+            frontend_hostname: DUMMY_FRONTEND_HOSTNAME.to_string(),
         },
     );
     let response = api::prepare_credential(
@@ -469,8 +625,10 @@ fn should_fail_prepare_credential_for_wrong_idp_canister_id() {
     let issuer_id = install_issuer(
         &env,
         &IssuerInit {
-            ic_root_key_der: hex::decode(DUMMY_ROOT_KEY).unwrap(),
+            ic_root_key_der: Some(hex::decode(DUMMY_ROOT_KEY).unwrap()),
             idp_canister_ids: vec![Principal::from_text("rdmx6-jaaaa-aaaaa-aaadq-cai").unwrap()], // does not match the DUMMY_II_CANISTER_ID, which is used in DUMMY_ALIAS_JWS
+            derivation_origin: DUMMY_DERIVATION_ORIGIN.to_string(),
+            frontend_hostname: DUMMY_FRONTEND_HOSTNAME.to_string(),
         },
     );
     let response = api::prepare_credential(
@@ -529,11 +687,14 @@ fn should_prepare_degree_credential_for_authorized_principal() {
 fn should_issue_credential_e2e() -> Result<(), CallError> {
     let env = env();
     let ii_id = install_canister(&env, II_WASM.clone());
+    let root_key = env.root_key().unwrap();
     let issuer_id = install_issuer(
         &env,
         &IssuerInit {
-            ic_root_key_der: env.root_key().to_vec(),
+            ic_root_key_der: Some(root_key.to_vec()),
             idp_canister_ids: vec![ii_id],
+            derivation_origin: DUMMY_DERIVATION_ORIGIN.to_string(),
+            frontend_hostname: DUMMY_FRONTEND_HOSTNAME.to_string(),
         },
     );
     let identity_number = flows::register_anchor(&env, ii_id);
@@ -565,7 +726,7 @@ fn should_issue_credential_e2e() -> Result<(), CallError> {
         .expect("get id_alias failed");
 
     let root_pk_raw =
-        extract_raw_root_pk_from_der(&env.root_key()).expect("Failed decoding IC root key.");
+        extract_raw_root_pk_from_der(&root_key).expect("Failed decoding IC root key.");
     let alias_tuple = get_verified_id_alias_from_jws(
         &id_alias_credentials
             .issuer_id_alias_credential
@@ -573,7 +734,7 @@ fn should_issue_credential_e2e() -> Result<(), CallError> {
         &id_alias_credentials.issuer_id_alias_credential.id_dapp,
         &canister_sig_pk.canister_id,
         &root_pk_raw,
-        env.time().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        time(&env) as u128,
     )
     .expect("Invalid ID alias");
 
@@ -621,39 +782,22 @@ fn should_issue_credential_e2e() -> Result<(), CallError> {
             &get_credential_response.unwrap().vc_jws,
             &issuer_id,
             &root_pk_raw,
-            env.time().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            time(&env) as u128,
         )
         .expect("credential verification failed");
-        validate_vc_claims(
-            &claims,
-            &credential_spec,
-            id_alias_credentials.issuer_id_alias_credential.id_alias,
-        );
+        let vc_claims = claims
+            .custom()
+            .expect("missing custom claims")
+            .as_object()
+            .expect("malformed custom claims")
+            .get("vc")
+            .expect("missing vc claims")
+            .as_object()
+            .expect("malformed vc claims");
+        validate_claims_match_spec(vc_claims, &credential_spec).expect("Clam validation failed");
     }
 
     Ok(())
-}
-
-/// Validates that the given claims are consistent with the credential spec and the
-/// requesting principal.
-fn validate_vc_claims(
-    claims: &JwtClaims<Value>,
-    credential_spec: &CredentialSpec,
-    subject_principal: Principal,
-) {
-    assert_eq!(
-        claims.sub(),
-        Some(did_for_principal(subject_principal)).as_deref()
-    );
-    let vc = claims.vc().expect("missing vc in id_alias JWT claims");
-    assert_eq!(
-        vc.get("type"),
-        Some(Value::Array(vec![
-            Value::String("VerifiableCredential".to_string()),
-            Value::String(credential_spec.credential_type.clone())
-        ]))
-        .as_ref()
-    );
 }
 
 #[test]
@@ -663,11 +807,34 @@ fn should_configure() {
     api::configure(&env, issuer_id, &DUMMY_ISSUER_INIT).expect("API call failed");
 }
 
+#[test]
+fn should_set_alternative_origins() {
+    let env = env();
+    let issuer_id = install_canister(&env, VC_ISSUER_WASM.clone());
+    let alternative_origins = r#"{"alternativeOrigins":["https://test.issuer"]}"#;
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        url: "/.well-known/ii-alternative-origins".to_string(),
+        headers: vec![],
+        body: ByteBuf::new(),
+        certificate_version: Some(2),
+    };
+
+    let http_response = http_request(&env, issuer_id, &request).expect("HTTP request failed");
+    assert_eq!(http_response.status_code, 404);
+
+    api::set_alternative_origins(&env, issuer_id, alternative_origins).expect("API call failed");
+
+    let http_response = http_request(&env, issuer_id, &request).expect("HTTP request failed");
+    assert_eq!(http_response.status_code, 200);
+    assert_eq!(&http_response.body, alternative_origins.as_bytes())
+}
+
 /// Verifies that the expected assets is delivered and certified.
 #[test]
 fn issuer_canister_serves_http_assets() -> Result<(), CallError> {
     fn verify_response_certification(
-        env: &StateMachine,
+        env: &PocketIc,
         canister_id: CanisterId,
         request: HttpRequest,
         http_response: HttpResponse,
@@ -684,11 +851,12 @@ fn issuer_canister_serves_http_assets() -> Result<(), CallError> {
                 status_code: http_response.status_code,
                 headers: http_response.headers,
                 body: http_response.body.into_vec(),
+                upgrade: None,
             },
             canister_id.as_slice(),
             time(env) as u128,
             Duration::from_secs(300).as_nanos(),
-            &env.root_key(),
+            &env.root_key().unwrap(),
             min_certification_version as u8,
         )
         .unwrap_or_else(|e| panic!("validation failed: {e}"))

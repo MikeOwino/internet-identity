@@ -7,22 +7,12 @@
  *   then we know which one the user is actually using
  * - It doesn't support creating credentials; use `WebAuthnIdentity` for that
  */
-import {
-  DerEncodedPublicKey,
-  PublicKey,
-  Signature,
-  SignIdentity,
-} from "@dfinity/agent";
+import { PublicKey, Signature, SignIdentity } from "@dfinity/agent";
 import { DER_COSE_OID, unwrapDER, WebAuthnIdentity } from "@dfinity/identity";
 import { isNullish } from "@dfinity/utils";
 import borc from "borc";
+import { CredentialData } from "./credential-devices";
 import { bufferEqual } from "./iiConnection";
-
-export type CredentialId = ArrayBuffer;
-export type CredentialData = {
-  pubkey: DerEncodedPublicKey;
-  credentialId: CredentialId;
-};
 
 /**
  * A SignIdentity that uses `navigator.credentials`. See https://webauthn.guide/ for
@@ -34,15 +24,19 @@ export class MultiWebAuthnIdentity extends SignIdentity {
    * @param json - json to parse
    */
   public static fromCredentials(
-    credentialData: CredentialData[]
+    credentialData: CredentialData[],
+    rpId: string | undefined
   ): MultiWebAuthnIdentity {
-    return new this(credentialData);
+    return new this(credentialData, rpId);
   }
 
   /* Set after the first `sign`, see `sign()` for more info. */
   protected _actualIdentity?: WebAuthnIdentity;
 
-  protected constructor(readonly credentialData: CredentialData[]) {
+  protected constructor(
+    readonly credentialData: CredentialData[],
+    readonly rpId: string | undefined
+  ) {
     super();
     this._actualIdentity = undefined;
   }
@@ -82,6 +76,7 @@ export class MultiWebAuthnIdentity extends SignIdentity {
         })),
         challenge: blob,
         userVerification: "discouraged",
+        rpId: this.rpId,
       },
     })) as PublicKeyCredential;
 

@@ -55,7 +55,7 @@ async function takeShowcaseScreenshots(browser: WebdriverIO.Browser) {
   // attributes, which we gather as the list of page names.
   const pageLinks = await browser.$$("[data-page-name]");
   const pageNames = await Promise.all(
-    pageLinks.map(async (link) => {
+    await pageLinks.map(async (link) => {
       const pageName = await link.getAttribute("data-page-name");
       return pageName;
     })
@@ -63,11 +63,6 @@ async function takeShowcaseScreenshots(browser: WebdriverIO.Browser) {
 
   // Iterate the pages and screenshot them
   for (const pageName of pageNames) {
-    // Skip the loader, because it's animated
-    if (pageName === "loader") {
-      continue;
-    }
-
     await visit(browser, `http://localhost:5174/${pageName}`);
 
     await browser.execute('document.body.style.caretColor = "transparent"');
@@ -109,7 +104,7 @@ async function withChrome<T>(
   const browser = await remote({
     capabilities: {
       browserName: "chrome",
-      browserVersion: "119.0.6045.105", // More information about available versions can be found here: https://github.com/GoogleChromeLabs/chrome-for-testing
+      browserVersion: "122.0.6261.111", // More information about available versions can be found here: https://github.com/GoogleChromeLabs/chrome-for-testing
       "goog:chromeOptions": chromeOptions,
     },
   });

@@ -1,6 +1,8 @@
+import { ERROR_SUPPORT_URL } from "$src/config";
 import { TemplateElement } from "$src/utils/lit-html";
 import { nonNullish } from "@dfinity/utils";
 import { html, render } from "lit-html";
+import { ifDefined } from "lit-html/directives/if-defined.js";
 import { mainWindow } from "./mainWindow";
 import { warnBox } from "./warnBox";
 
@@ -8,6 +10,7 @@ export type ErrorOptions = {
   title: TemplateElement;
   message: TemplateElement;
   detail?: TemplateElement;
+  errorCode?: string;
   primaryButton: TemplateElement;
 };
 
@@ -31,9 +34,20 @@ ${options.detail}</pre
       })}
 
       <div class="l-stack">
-        <button id="displayErrorPrimary" class="c-button c-button--primary">
+        <button
+          id="displayErrorPrimary"
+          data-error-code=${ifDefined(options.errorCode)}
+          class="c-button c-button--primary"
+        >
           ${options.primaryButton}
         </button>
+        <a
+          href="${ERROR_SUPPORT_URL}"
+          target="_blank"
+          class="c-button c-button--secondary"
+        >
+          Go to support
+        </a>
       </div>`,
   });
 

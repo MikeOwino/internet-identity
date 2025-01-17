@@ -1,55 +1,83 @@
-import {
-  Challenge,
-  CredentialId,
-  KeyType,
-} from "$generated/internet_identity_types";
+import { AuthnMethodData } from "$generated/internet_identity_types";
 import { withLoader } from "$src/components/loader";
 import {
   PinIdentityMaterial,
   constructPinIdentity,
 } from "$src/crypto/pinIdentity";
-import { tempKeyWarningBox } from "$src/flows/manage/tempKeys";
 import { idbStorePinIdentityMaterial } from "$src/flows/pin/idb";
-import { setPinFlow } from "$src/flows/pin/setPin";
-import { pinStepper } from "$src/flows/pin/stepper";
-import { registerStepper } from "$src/flows/register/stepper";
 import { registerDisabled } from "$src/flows/registerDisabled";
 import { I18n } from "$src/i18n";
 import { setAnchorUsed } from "$src/storage";
-import { authenticatorAttachmentToKeyType } from "$src/utils/authenticatorAttachment";
-import { LoginFlowCanceled } from "$src/utils/flowResult";
 import {
-  AuthenticatedConnection,
+  passkeyAuthnMethodData,
+  pinAuthnMethodData,
+} from "$src/utils/authnMethodData";
+import {
+  AlreadyInProgress,
+  ApiError,
   Connection,
   IIWebAuthnIdentity,
-  RegisterResult,
+  InvalidAuthnMethod,
+  InvalidCaller,
+  LoginSuccess,
+  NoRegistrationFlow,
+  RateLimitExceeded,
+  RegisterNoSpace,
+  RegistrationFlowStepSuccess,
+  UnexpectedCall,
+  WrongCaptchaSolution,
 } from "$src/utils/iiConnection";
 import { SignIdentity } from "@dfinity/agent";
 import { ECDSAKeyIdentity } from "@dfinity/identity";
 import { nonNullish } from "@dfinity/utils";
 import { TemplateResult } from "lit-html";
 import type { UAParser } from "ua-parser-js";
-import { badChallenge, precomputeFirst, promptCaptcha } from "./captcha";
+import { tempKeyWarningBox } from "../manage/tempKeys";
+import { setPinFlow } from "../pin/setPin";
+import { precomputeFirst, promptCaptcha } from "./captcha";
 import { displayUserNumberWarmup } from "./finish";
 import { savePasskeyOrPin } from "./passkey";
 
-/** Registration (anchor creation) flow for new users */
-export const registerFlow = async <T>({
-  createChallenge: createChallenge_,
-  register,
+/** Registration (identity creation) flow for new users */
+export const registerFlow = async ({
+  identityRegistrationStart,
+  checkCaptcha,
+  identityRegistrationFinish,
   storePinIdentity,
   registrationAllowed,
   pinAllowed,
   uaParser,
 }: {
-  createChallenge: () => Promise<Challenge>;
-  register: (opts: {
-    alias: string;
+  identityRegistrationStart: () => Promise<
+    | RegistrationFlowStepSuccess
+    | ApiError
+    | InvalidCaller
+    | AlreadyInProgress
+    | RateLimitExceeded
+  >;
+  checkCaptcha: (
+    captchaSolution: string
+  ) => Promise<
+    | RegistrationFlowStepSuccess
+    | ApiError
+    | NoRegistrationFlow
+    | UnexpectedCall
+    | WrongCaptchaSolution
+  >;
+  identityRegistrationFinish: ({
+    identity,
+    authnMethod,
+  }: {
     identity: SignIdentity;
-    keyType: KeyType;
-    credentialId?: CredentialId;
-    challengeResult: { chars: string; challenge: Challenge };
-  }) => Promise<RegisterResult<T>>;
+    authnMethod: AuthnMethodData;
+  }) => Promise<
+    | LoginSuccess
+    | ApiError
+    | NoRegistrationFlow
+    | UnexpectedCall
+    | RegisterNoSpace
+    | InvalidAuthnMethod
+  >;
   storePinIdentity: (opts: {
     userNumber: bigint;
     pinIdentityMaterial: PinIdentityMaterial;
@@ -57,16 +85,27 @@ export const registerFlow = async <T>({
   registrationAllowed: boolean;
   pinAllowed: () => Promise<boolean>;
   uaParser: PreloadedUAParser;
-}): Promise<RegisterResult<T> | "canceled"> => {
+}): Promise<
+  | (LoginSuccess & { authnMethod: "passkey" | "pin" })
+  | ApiError
+  | NoRegistrationFlow
+  | UnexpectedCall
+  | RegisterNoSpace
+  | InvalidAuthnMethod
+  | InvalidCaller
+  | AlreadyInProgress
+  | RateLimitExceeded
+  | "canceled"
+> => {
   if (!registrationAllowed) {
     const result = await registerDisabled();
-    result satisfies LoginFlowCanceled;
+    result satisfies { tag: "canceled" };
     return "canceled";
   }
 
-  // Kick-off the challenge request early, so that we might already
+  // Kick-off the flow start request early, so that we might already
   // have a captcha to show once we get to the CAPTCHA screen
-  const createChallenge = precomputeFirst(() => createChallenge_());
+  const flowStart = precomputeFirst(() => identityRegistrationStart());
 
   const displayUserNumber = displayUserNumberWarmup();
   const savePasskeyResult = await savePasskeyOrPin({
@@ -89,21 +128,27 @@ export const registerFlow = async <T>({
       const { identity, pinIdentityMaterial } = await withLoader(() =>
         constructPinIdentity(pinResult)
       );
+      const alias = await inferPinAlias({
+        userAgent: navigator.userAgent,
+        uaParser,
+      });
       return {
         identity,
-        alias: await inferPinAlias({
-          userAgent: navigator.userAgent,
-          uaParser,
+        authnMethodData: pinAuthnMethodData({
+          alias,
+          pubKey: identity.getPublicKey().toDer(),
         }),
-        captchaStepper: pinStepper({ current: "captcha" }),
-        finishStepper: pinStepper({ current: "finish" }),
-        keyType: { browser_storage_key: null },
         finalizeIdentity: (userNumber: bigint) =>
           storePinIdentity({ userNumber, pinIdentityMaterial }),
         finishSlot: tempKeyWarningBox({ i18n: new I18n() }),
+        authnMethod: "pin" as const,
       };
     } else {
       const identity = savePasskeyResult;
+      // TODO: Return something meaningful if getting the passkey identity fails
+      if (identity === undefined) {
+        return "canceled";
+      }
       const alias = await inferPasskeyAlias({
         authenticatorType: identity.getAuthenticatorAttachment(),
         userAgent: navigator.userAgent,
@@ -111,13 +156,13 @@ export const registerFlow = async <T>({
       });
       return {
         identity,
-        alias,
-        captchaStepper: registerStepper({ current: "captcha" }),
-        finishStepper: registerStepper({ current: "finish" }),
-        credentialId: new Uint8Array(identity.rawId),
-        keyType: authenticatorAttachmentToKeyType(
-          identity.getAuthenticatorAttachment()
-        ),
+        authnMethodData: passkeyAuthnMethodData({
+          alias,
+          pubKey: identity.getPublicKey().toDer(),
+          credentialId: identity.rawId,
+          authenticatorAttachment: identity.getAuthenticatorAttachment(),
+        }),
+        authnMethod: "passkey" as const,
       };
     }
   })();
@@ -128,73 +173,83 @@ export const registerFlow = async <T>({
 
   const {
     identity,
-    alias,
-    captchaStepper,
-    finishStepper,
-    credentialId,
-    keyType,
+    authnMethodData,
     finalizeIdentity,
     finishSlot,
+    authnMethod,
   }: {
     identity: SignIdentity;
-    alias: string;
-    captchaStepper: TemplateResult;
-    finishStepper: TemplateResult;
-    credentialId?: CredentialId;
-    keyType: KeyType;
+    authnMethodData: AuthnMethodData;
     finalizeIdentity?: (userNumber: bigint) => Promise<void>;
     finishSlot?: TemplateResult;
+    authnMethod: "pin" | "passkey";
   } = result_;
 
-  const result = await promptCaptcha({
-    createChallenge,
-    stepper: captchaStepper,
-    register: async ({ chars, challenge }) => {
-      const result = await register({
-        identity,
-        alias,
-        keyType,
-        credentialId,
-        challengeResult: { chars, challenge },
-      });
-
-      if (result.kind === "badChallenge") {
-        return badChallenge;
-      }
-
-      return result;
-    },
-  });
-
-  if ("tag" in result) {
-    result.tag satisfies "canceled";
-    return "canceled";
+  const startResult = await flowStart();
+  if (startResult.kind !== "registrationFlowStepSuccess") {
+    return startResult;
   }
+  startResult satisfies RegistrationFlowStepSuccess;
 
-  if (result.kind === "loginSuccess") {
-    const userNumber = result.userNumber;
-    await finalizeIdentity?.(userNumber);
-    await setAnchorUsed(userNumber);
-    await displayUserNumber({
-      userNumber,
-      stepper: finishStepper,
-      marketingIntroSlot: finishSlot,
+  if (startResult.nextStep.step === "checkCaptcha") {
+    const captchaResult = await promptCaptcha({
+      captcha_png_base64: startResult.nextStep.captcha_png_base64,
+      checkCaptcha,
     });
+    if (captchaResult === "canceled") {
+      return "canceled";
+    }
+    if (captchaResult.kind !== "registrationFlowStepSuccess") {
+      return captchaResult;
+    }
+    captchaResult satisfies RegistrationFlowStepSuccess;
   }
-  return result;
+
+  const result = await withLoader(() =>
+    identityRegistrationFinish({
+      authnMethod: authnMethodData,
+      identity,
+    })
+  );
+
+  if (result.kind !== "loginSuccess") {
+    return result;
+  }
+  result.kind satisfies "loginSuccess";
+
+  const userNumber = result.userNumber;
+  await finalizeIdentity?.(userNumber);
+  // We don't want to nudge the user with the recovery phrase warning page
+  // right after they've created their anchor.
+  result.connection.updateIdentityMetadata({
+    recoveryPageShownTimestampMillis: Date.now(),
+  });
+  // Immediately commit (and await) the metadata, so that the identity is fully set up when the user sees the success page
+  // This way, dropping of at that point does not negatively impact UX with additional nagging.
+  await withLoader(() =>
+    Promise.all([result.connection.commitMetadata(), setAnchorUsed(userNumber)])
+  );
+  await displayUserNumber({
+    userNumber,
+    marketingIntroSlot: finishSlot,
+  });
+  return { ...result, authnMethod };
 };
 
-export type RegisterFlowOpts<T = AuthenticatedConnection> = Parameters<
-  typeof registerFlow<T>
->[0];
+export type RegisterFlowOpts = Parameters<typeof registerFlow>[0];
 
-export const getRegisterFlowOpts = ({
+export const getRegisterFlowOpts = async ({
   connection,
+  allowPinRegistration,
 }: {
   connection: Connection;
-}): RegisterFlowOpts => {
+  allowPinRegistration: boolean;
+}): Promise<RegisterFlowOpts> => {
   // Kick-off fetching "ua-parser-js";
   const uaParser = loadUAParser();
+  const tempIdentity = await ECDSAKeyIdentity.generate({
+    extractable: false,
+  });
   return {
     /** Check that the current origin is not the explicit canister id or a raw url.
      *  Explanation why we need to do this:
@@ -204,31 +259,22 @@ export const getRegisterFlowOpts = ({
       !/(^https:\/\/rdmx6-jaaaa-aaaaa-aaadq-cai\.ic0\.app$)|(.+\.raw\..+)/.test(
         window.origin
       ),
-    createChallenge: () => connection.createChallenge(),
     pinAllowed: () =>
-      pinRegisterAllowed({ userAgent: navigator.userAgent, uaParser }),
-    register: async ({
-      identity,
-      alias,
-      keyType,
-      credentialId,
-      challengeResult: {
-        chars,
-        challenge: { challenge_key: key },
-      },
-    }) => {
-      const tempIdentity = await ECDSAKeyIdentity.generate({
-        extractable: false,
-      });
-      return await connection.register({
-        identity,
+      // If pin auth is disallowed by the authenticating dapp then abort, otherwise check
+      // if pin auth is allowed for the user agent
+      allowPinRegistration
+        ? pinRegisterAllowed({ userAgent: navigator.userAgent, uaParser })
+        : Promise.resolve(false),
+    identityRegistrationStart: async () =>
+      await connection.identity_registration_start({ tempIdentity }),
+    checkCaptcha: async (captchaSolution) =>
+      await connection.check_captcha({ tempIdentity, captchaSolution }),
+    identityRegistrationFinish: async ({ identity, authnMethod }) =>
+      await connection.identity_registration_finish({
         tempIdentity,
-        alias,
-        keyType,
-        credentialId,
-        challengeResult: { chars, key },
-      });
-    },
+        identity,
+        authnMethod,
+      }),
     uaParser,
     storePinIdentity: idbStorePinIdentityMaterial,
   };

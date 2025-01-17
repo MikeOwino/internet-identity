@@ -12,7 +12,7 @@ ENV TZ=UTC
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
     apt -yq update && \
     apt -yqq install --no-install-recommends curl ca-certificates \
-        build-essential pkg-config libssl-dev llvm-dev liblmdb-dev clang cmake
+        build-essential pkg-config libssl-dev llvm-dev liblmdb-dev clang cmake jq
 
 # Install node
 RUN curl --fail -sSf https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
@@ -36,9 +36,11 @@ COPY ./scripts/bootstrap ./scripts/bootstrap
 COPY ./rust-toolchain.toml ./rust-toolchain.toml
 
 RUN ./scripts/bootstrap
+RUN curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+RUN wasm-pack --version
 
 # Pre-build all cargo dependencies. Because cargo doesn't have a build option
-# to build only the dependecies, we pretend that our project is a simple, empty
+# to build only the dependencies, we pretend that our project is a simple, empty
 # `lib.rs`. When we COPY the actual files we make sure to `touch` lib.rs so
 # that cargo knows to rebuild it with the new content.
 COPY Cargo.lock .
@@ -47,8 +49,7 @@ COPY src/internet_identity/Cargo.toml src/internet_identity/Cargo.toml
 COPY src/internet_identity_interface/Cargo.toml src/internet_identity_interface/Cargo.toml
 COPY src/archive/Cargo.toml src/archive/Cargo.toml
 COPY src/canister_tests/Cargo.toml src/canister_tests/Cargo.toml
-COPY src/canister_sig_util/Cargo.toml src/canister_sig_util/Cargo.toml
-COPY src/vc_util/Cargo.toml src/vc_util/Cargo.toml
+COPY src/sig-verifier-js/Cargo.toml src/sig-verifier-js/Cargo.toml
 COPY src/asset_util/Cargo.toml src/asset_util/Cargo.toml
 ENV CARGO_TARGET_DIR=/cargo_target
 COPY ./scripts/build ./scripts/build
@@ -60,10 +61,8 @@ RUN mkdir -p src/internet_identity/src \
     && touch src/archive/src/lib.rs \
     && mkdir -p src/canister_tests/src \
     && touch src/canister_tests/src/lib.rs \
-    && mkdir -p src/canister_sig_util/src \
-    && touch src/canister_sig_util/src/lib.rs \
-    && mkdir -p src/vc_util/src \
-    && touch src/vc_util/src/lib.rs \
+    && mkdir -p src/sig-verifier-js/src \
+    && touch src/sig-verifier-js/src/lib.rs \
     && mkdir -p src/asset_util/src \
     && touch src/asset_util/src/lib.rs \
     && ./scripts/build --only-dependencies --internet-identity --archive \
@@ -80,15 +79,12 @@ ARG II_VERSION=
 ARG II_FETCH_ROOT_KEY=
 ARG II_DUMMY_CAPTCHA=
 ARG II_DUMMY_AUTH=
-ARG II_INSECURE_REQUESTS=
-
-# DFX specific metadata for dfx deps
-ARG DFX_METADATA=
+ARG II_DEV_CSP=
 
 RUN touch src/*/src/lib.rs
 RUN npm ci
 
-RUN ./scripts/build ${DFX_METADATA:+"--dfx-metadata" "$DFX_METADATA"}
+RUN ./scripts/build
 RUN sha256sum /internet_identity.wasm.gz
 
 FROM deps as build_archive

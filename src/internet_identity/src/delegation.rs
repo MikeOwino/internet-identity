@@ -1,15 +1,19 @@
 use crate::ii_domain::IIDomain;
-use crate::state::persistent_state_mut;
-use crate::{hash, state, update_root_hash, DAY_NS, MINUTE_NS};
+use crate::stats::event_stats::{
+    update_event_based_stats, Event, EventData, PrepareDelegationEvent,
+};
+use crate::{state, update_root_hash, DAY_NS, MINUTE_NS};
 use candid::Principal;
-use canister_sig_util::signature_map::SignatureMap;
-use canister_sig_util::CanisterSigPublicKey;
+use ic_canister_sig_creation::signature_map::{CanisterSigInputs, SignatureMap};
+use ic_canister_sig_creation::{
+    delegation_signature_msg, CanisterSigPublicKey, DELEGATION_SIG_DOMAIN,
+};
 use ic_cdk::api::time;
 use ic_cdk::{id, trap};
 use ic_certification::Hash;
 use internet_identity_interface::internet_identity::types::*;
 use serde_bytes::ByteBuf;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 
 // The expiration used for delegations if none is specified
@@ -30,11 +34,11 @@ pub async fn prepare_delegation(
     state::ensure_salt_set().await;
     check_frontend_length(&frontend);
 
-    let delta = u64::min(
+    let session_duration_ns = u64::min(
         max_time_to_live.unwrap_or(DEFAULT_EXPIRATION_PERIOD_NS),
         MAX_EXPIRATION_PERIOD_NS,
     );
-    let expiration = time().saturating_add(delta);
+    let expiration = time().saturating_add(session_duration_ns);
     let seed = calculate_seed(anchor_number, &frontend);
 
     state::signature_map_mut(|sigs| {
@@ -42,7 +46,7 @@ pub async fn prepare_delegation(
     });
     update_root_hash();
 
-    delegation_bookkeeping(frontend, ii_domain);
+    delegation_bookkeeping(frontend, ii_domain.clone(), session_duration_ns);
 
     (
         ByteBuf::from(der_encode_canister_sig_key(seed.to_vec())),
@@ -51,24 +55,34 @@ pub async fn prepare_delegation(
 }
 
 /// Update metrics and the list of latest front-end origins.
-fn delegation_bookkeeping(frontend: FrontendHostname, ii_domain: &Option<IIDomain>) {
+fn delegation_bookkeeping(
+    frontend: FrontendHostname,
+    ii_domain: Option<IIDomain>,
+    session_duration_ns: u64,
+) {
     state::usage_metrics_mut(|metrics| {
         metrics.delegation_counter += 1;
     });
-    if ii_domain.is_some() && !is_dev_frontend(&frontend) {
-        update_latest_delegation_origins(frontend);
+    if !is_dev_frontend(&frontend) {
+        update_event_based_stats(EventData {
+            event: Event::PrepareDelegation(PrepareDelegationEvent {
+                ii_domain: ii_domain.clone(),
+                frontend: frontend.clone(),
+                session_duration_ns,
+            }),
+        });
     }
 }
 
 /// Filter out derivation origins that most likely point to development setups.
-/// This is not bullet proof but given the data we collected so far it should be good for now.
+/// This is not bulletproof but given the data we collected so far it should be good for now.
 fn is_dev_frontend(frontend: &FrontendHostname) -> bool {
     if frontend.starts_with("http://") || frontend.contains("localhost") {
         // we don't care about insecure origins or localhost
         return true;
     }
 
-    // lets check for local IP addresses
+    // let's check for local IP addresses
     if let Some(hostname) = frontend
         .strip_prefix("https://")
         .and_then(|s| s.split(':').next())
@@ -82,37 +96,6 @@ fn is_dev_frontend(frontend: &FrontendHostname) -> bool {
     false
 }
 
-/// Add the current front-end to the list of latest used front-end origins.
-fn update_latest_delegation_origins(frontend: FrontendHostname) {
-    let now_ns = time();
-
-    persistent_state_mut(|persistent_state| {
-        let latest_delegation_origins = persistent_state
-            .latest_delegation_origins
-            .get_or_insert(HashMap::new());
-
-        if let Some(timestamp_ns) = latest_delegation_origins.get_mut(&frontend) {
-            *timestamp_ns = now_ns;
-        } else {
-            latest_delegation_origins.insert(frontend, now_ns);
-        };
-
-        // drop entries older than 30 days
-        latest_delegation_origins.retain(|_, timestamp_ns| now_ns - *timestamp_ns < 30 * DAY_NS);
-
-        // if we still have too many entries, drop the oldest
-        if latest_delegation_origins.len() as u64
-            > persistent_state.max_num_latest_delegation_origins.unwrap()
-        {
-            // if this case is hit often (i.e. we routinely have more than 1000 entries), we should
-            // consider using a more efficient data structure
-            let mut values: Vec<_> = latest_delegation_origins.clone().into_iter().collect();
-            values.sort_by(|(_, timestamp_1), (_, timestamp_2)| timestamp_1.cmp(timestamp_2));
-            latest_delegation_origins.remove(&values[0].0);
-        };
-    });
-}
-
 pub fn get_delegation(
     anchor_number: AnchorNumber,
     frontend: FrontendHostname,
@@ -122,16 +105,12 @@ pub fn get_delegation(
     check_frontend_length(&frontend);
 
     state::assets_and_signatures(|certified_assets, sigs| {
-        let message_hash = delegation_signature_msg_hash(&Delegation {
-            pubkey: session_key.clone(),
-            expiration,
-            targets: None,
-        });
-        match sigs.get_signature_as_cbor(
-            &calculate_seed(anchor_number, &frontend),
-            message_hash,
-            Some(certified_assets.root_hash()),
-        ) {
+        let inputs = CanisterSigInputs {
+            domain: DELEGATION_SIG_DOMAIN,
+            seed: &calculate_seed(anchor_number, &frontend),
+            message: &delegation_signature_msg(&session_key, expiration, None),
+        };
+        match sigs.get_signature_as_cbor(&inputs, Some(certified_assets.root_hash())) {
             Ok(signature) => GetDelegationResponse::SignedDelegation(SignedDelegation {
                 delegation: Delegation {
                     pubkey: session_key,
@@ -168,29 +147,18 @@ fn calculate_seed(anchor_number: AnchorNumber, frontend: &FrontendHostname) -> H
     blob.push(frontend.bytes().len() as u8);
     blob.extend(frontend.bytes());
 
-    hash::hash_bytes(blob)
+    hash_bytes(blob)
+}
+
+fn hash_bytes(value: impl AsRef<[u8]>) -> Hash {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_ref());
+    hasher.finalize().into()
 }
 
 pub(crate) fn der_encode_canister_sig_key(seed: Vec<u8>) -> Vec<u8> {
     let my_canister_id = id();
     CanisterSigPublicKey::new(my_canister_id, seed).to_der()
-}
-
-fn delegation_signature_msg_hash(d: &Delegation) -> Hash {
-    use hash::Value;
-
-    let mut m = HashMap::new();
-    m.insert("pubkey", Value::Bytes(d.pubkey.as_slice()));
-    m.insert("expiration", Value::U64(d.expiration));
-    if let Some(targets) = d.targets.as_ref() {
-        let mut arr = Vec::with_capacity(targets.len());
-        for t in targets.iter() {
-            arr.push(Value::Bytes(t.as_ref()));
-        }
-        m.insert("targets", Value::Array(arr));
-    }
-    let map_hash = hash::hash_of_map(m);
-    hash::hash_with_domain(b"ic-request-auth-delegation", &map_hash)
 }
 
 fn add_delegation_signature(
@@ -199,12 +167,12 @@ fn add_delegation_signature(
     seed: &[u8],
     expiration: Timestamp,
 ) {
-    let msg_hash = delegation_signature_msg_hash(&Delegation {
-        pubkey: pk,
-        expiration,
-        targets: None,
-    });
-    sigs.add_signature(seed, msg_hash);
+    let inputs = CanisterSigInputs {
+        domain: DELEGATION_SIG_DOMAIN,
+        seed,
+        message: &delegation_signature_msg(&pk, expiration, None),
+    };
+    sigs.add_signature(&inputs);
 }
 
 pub(crate) fn check_frontend_length(frontend: &FrontendHostname) {

@@ -3,18 +3,14 @@
 
 use candid::Principal;
 use canister_tests::api::internet_identity as api;
-use canister_tests::flows;
 use canister_tests::framework::*;
-use ic_test_state_machine_client::CallError;
-use ic_test_state_machine_client::ErrorCode::CanisterCalledTrap;
 use internet_identity_interface::internet_identity::types::*;
-use rand::Rng;
+use pocket_ic::common::rest::BlobCompression::NoCompression;
+use pocket_ic::CallError;
+use pocket_ic::ErrorCode::CanisterCalledTrap;
 use regex::Regex;
 use serde_bytes::ByteBuf;
 use std::path::PathBuf;
-
-#[cfg(test)]
-mod test_setup_helpers;
 
 /// Known devices that exist in the genesis memory backups.
 fn known_devices() -> [DeviceData; 6] {
@@ -75,12 +71,17 @@ fn should_issue_same_principal_after_restoring_backup() -> Result<(), CallError>
     let principal = Principal::self_authenticating(hex::decode(PUBLIC_KEY).unwrap());
 
     let env = env();
-    let canister_id = install_ii_canister(&env, EMPTY_WASM.clone());
+    // the principal is dependent on the canister id, hence we need to create the canister with a
+    // specific one.
+    let canister_id = Principal::from_text("rwlgt-iiaaa-aaaaa-aaaaa-cai").unwrap();
+    env.create_canister_with_id(None, None, canister_id)
+        .expect("failed to create canister");
+    env.install_canister(canister_id, EMPTY_WASM.clone(), vec![], None);
 
     restore_compressed_stable_memory(
         &env,
         canister_id,
-        "stable_memory/genesis-layout-migrated-to-v7.bin.gz",
+        "stable_memory/genesis-layout-migrated-to-v9.bin.gz",
     );
     upgrade_ii_canister(&env, canister_id, II_WASM.clone());
 
@@ -115,7 +116,7 @@ fn should_modify_devices_after_restoring_backup() -> Result<(), CallError> {
     restore_compressed_stable_memory(
         &env,
         canister_id,
-        "stable_memory/genesis-layout-migrated-to-v7.bin.gz",
+        "stable_memory/genesis-layout-migrated-to-v9.bin.gz",
     );
     upgrade_ii_canister(&env, canister_id, II_WASM.clone());
 
@@ -149,7 +150,7 @@ fn should_not_break_on_multiple_legacy_recovery_phrases() -> Result<(), CallErro
     restore_compressed_stable_memory(
         &env,
         canister_id,
-        "stable_memory/multiple-recovery-phrases-v7.bin.gz",
+        "stable_memory/multiple-recovery-phrases-v9.bin.gz",
     );
     upgrade_ii_canister(&env, canister_id, II_WASM.clone());
 
@@ -184,7 +185,7 @@ fn should_allow_modification_after_deleting_second_recovery_phrase() -> Result<(
     restore_compressed_stable_memory(
         &env,
         canister_id,
-        "stable_memory/multiple-recovery-phrases-v7.bin.gz",
+        "stable_memory/multiple-recovery-phrases-v9.bin.gz",
     );
     upgrade_ii_canister(&env, canister_id, II_WASM.clone());
 
@@ -225,14 +226,14 @@ fn should_allow_modification_after_deleting_second_recovery_phrase() -> Result<(
 }
 
 #[test]
-fn should_read_persistent_state_v7() -> Result<(), CallError> {
+fn should_read_persistent_state_without_archive() -> Result<(), CallError> {
     let env = env();
     let canister_id = install_ii_canister(&env, EMPTY_WASM.clone());
 
     restore_compressed_stable_memory(
         &env,
         canister_id,
-        "stable_memory/persistent_state_no_archive_v7.bin.gz",
+        "stable_memory/persistent_state_no_archive_v9.bin.gz",
     );
     upgrade_ii_canister(&env, canister_id, II_WASM.clone());
 
@@ -242,107 +243,8 @@ fn should_read_persistent_state_v7() -> Result<(), CallError> {
     let stats = api::stats(&env, canister_id)?;
     assert!(stats.archive_info.archive_canister.is_none());
     assert!(stats.archive_info.archive_config.is_none());
-    assert_eq!(7, stats.storage_layout_version);
-    Ok(())
-}
-
-#[test]
-fn should_grow_persistent_state_v7_by_bucket_size() -> Result<(), CallError> {
-    let env = env();
-    let canister_id = install_ii_canister(&env, EMPTY_WASM.clone());
-
-    // A memory bucket has 128 pages, each 64kB.  A single anchor occupies 4kB, hence we have
-    // 16 anchors per page, and 2048 per bucket.
-    // The stored persistent state has 2047 anchors starting from anchor_number = 1000.
-    // It has only 2047 (and not 2048) anchors to leave space for storing `PersistentState`
-    // structure during the pre-upgrade hook (otherwise a second bucket gets allocated
-    // for `PersistentState` although all the 2048 anchors fit into the first bucket).
-    let first_anchor_number: AnchorNumber = 1000;
-    let anchor_count = 2047;
-    restore_compressed_stable_memory(
-        &env,
-        canister_id,
-        "stable_memory/persistent_state_full_bucket_v7_2047_ids.bin.gz",
-    );
-    upgrade_ii_canister(&env, canister_id, II_WASM.clone());
-    let stats = api::stats(&env, canister_id)?;
-    assert_eq!(7, stats.storage_layout_version);
-
-    // Check the number of allocated memory pages before expansion.
-    let metrics = get_metrics(&env, canister_id);
-    let (stable_memory_pages, _) = parse_metric(&metrics, "internet_identity_stable_memory_pages");
-    assert_eq!(stable_memory_pages, 130f64);
-
-    // Verify a random existing anchor.
-    let random_anchor_offset = rand::thread_rng().gen_range(0..anchor_count);
-    let random_anchor = first_anchor_number + random_anchor_offset;
-    let principal = test_setup_helpers::principal(random_anchor_offset as usize);
-    let devices =
-        api::get_anchor_info(&env, canister_id, principal, random_anchor)?.into_device_data();
-    assert_eq!(devices.len(), 2);
-    let device = &devices[0];
-    assert_eq!(format!("device #{}", random_anchor_offset), device.alias);
-
-    // Add a new anchor -- this DOES NOT trigger an allocation of a new managed memory bucket.
-    // as we're filling up the first bucket to 2048 anchors.
-    let anchor_offset = anchor_count;
-    let next_anchor: AnchorNumber = first_anchor_number + anchor_offset;
-    let new_anchor_number = flows::register_anchor_with(
-        &env,
-        canister_id,
-        test_setup_helpers::principal(anchor_offset as usize),
-        &test_setup_helpers::sample_unique_device(anchor_offset as usize),
-    );
-    assert_eq!(next_anchor, new_anchor_number);
-
-    // Verify the newly added anchor.
-    let principal = test_setup_helpers::principal(anchor_offset as usize);
-    let devices =
-        api::get_anchor_info(&env, canister_id, principal, next_anchor)?.into_device_data();
-    assert_eq!(devices.len(), 1);
-    let device = &devices[0];
-    assert_eq!(format!("device #{}", anchor_offset), device.alias);
-
-    // Verify the number of allocated memory pages didn't grow yet.
-    let metrics = get_metrics(&env, canister_id);
-    let (stable_memory_pages, _) = parse_metric(&metrics, "internet_identity_stable_memory_pages");
-    assert_eq!(stable_memory_pages, 130f64);
-
-    // Add another anchor -- this DOES trigger an allocation of a new managed memory bucket.
-    let anchor_offset = anchor_count + 1;
-    let next_anchor: AnchorNumber = first_anchor_number + anchor_offset;
-    let new_anchor_number = flows::register_anchor_with(
-        &env,
-        canister_id,
-        test_setup_helpers::principal(anchor_offset as usize),
-        &test_setup_helpers::sample_unique_device(anchor_offset as usize),
-    );
-    assert_eq!(next_anchor, new_anchor_number);
-
-    // Verify the newly added anchor.
-    let principal = test_setup_helpers::principal(anchor_offset as usize);
-    let devices =
-        api::get_anchor_info(&env, canister_id, principal, next_anchor)?.into_device_data();
-    assert_eq!(devices.len(), 1);
-    let device = &devices[0];
-    assert_eq!(format!("device #{}", anchor_offset), device.alias);
-
-    // Verify the number of allocated memory pages grew as expected (i.e. by 128 pages).
-    assert_eq!(next_anchor, new_anchor_number);
-    let metrics = get_metrics(&env, canister_id);
-    let (stable_memory_pages, _) = parse_metric(&metrics, "internet_identity_stable_memory_pages");
-    assert_eq!(stable_memory_pages, 258f64);
-
-    // Verify another random existing anchor (after addition of a new one).
-    let random_anchor_offset = rand::thread_rng().gen_range(0..anchor_count);
-    let random_anchor = first_anchor_number + random_anchor_offset;
-    let principal = test_setup_helpers::principal(random_anchor_offset as usize);
-    let devices =
-        api::get_anchor_info(&env, canister_id, principal, random_anchor)?.into_device_data();
-    assert_eq!(devices.len(), 2);
-    let device = &devices[0];
-    assert_eq!(format!("device #{}", random_anchor_offset), device.alias);
-
+    // auto-migration to v9
+    assert_eq!(stats.storage_layout_version, 9);
     Ok(())
 }
 
@@ -355,7 +257,7 @@ fn should_read_persistent_state_with_archive() -> Result<(), CallError> {
     restore_compressed_stable_memory(
         &env,
         canister_id,
-        "stable_memory/persistent_state_archive_v7.bin.gz",
+        "stable_memory/persistent_state_archive_v9.bin.gz",
     );
     upgrade_ii_canister(&env, canister_id, II_WASM.clone());
 
@@ -378,7 +280,8 @@ fn should_read_persistent_state_with_archive() -> Result<(), CallError> {
             .to_vec(),
         hex::decode("12e2c2bd05dfcd86e3004ecd5f00533e6120e7bcf82bac0753af0a7fe14bfea1").unwrap()
     );
-    assert_eq!(stats.storage_layout_version, 7);
+    // auto-migration to v9
+    assert_eq!(stats.storage_layout_version, 9);
     Ok(())
 }
 
@@ -390,7 +293,7 @@ fn should_trap_on_old_stable_memory() -> Result<(), CallError> {
 
     let stable_memory_backup =
         std::fs::read(PathBuf::from("stable_memory/genesis-memory-layout.bin")).unwrap();
-    env.set_stable_memory(canister_id, ByteBuf::from(stable_memory_backup));
+    env.set_stable_memory(canister_id, stable_memory_backup, NoCompression);
     let result = upgrade_ii_canister_with_arg(&env, canister_id, II_WASM.clone(), None);
     assert!(result.is_err());
     let err = result.err().unwrap();
@@ -398,34 +301,7 @@ fn should_trap_on_old_stable_memory() -> Result<(), CallError> {
         CallError::Reject(err) => panic!("unexpected error {err}"),
         CallError::UserError(err) => {
             assert_eq!(err.code, CanisterCalledTrap);
-            assert!(err.description.contains("stable memory layout version 1 is no longer supported:\nEither reinstall (wiping stable memory) or migrate using a previous II version"));
-        }
-    }
-    Ok(())
-}
-
-/// Tests that II will refuse to upgrade on stable memory without persistent state.
-#[test]
-fn should_trap_on_missing_persistent_state() -> Result<(), CallError> {
-    let env = env();
-    let canister_id = install_ii_canister(&env, EMPTY_WASM.clone());
-    restore_compressed_stable_memory(
-        &env,
-        canister_id,
-        "stable_memory/no-persistent-state-v7.bin.gz",
-    );
-
-    let result = upgrade_ii_canister_with_arg(&env, canister_id, II_WASM.clone(), None);
-
-    assert!(result.is_err());
-    let err = result.err().unwrap();
-    match err {
-        CallError::Reject(err) => panic!("unexpected error {err}"),
-        CallError::UserError(err) => {
-            assert_eq!(err.code, CanisterCalledTrap);
-            assert!(err
-                .description
-                .contains("failed to recover persistent state! Err: NotFound"));
+            assert!(err.description.contains("stable memory layout version 1 is no longer supported:\nEither reinstall (wiping stable memory) or upgrade sequentially to the latest version of II by installing each intermediate version in turn"));
         }
     }
     Ok(())

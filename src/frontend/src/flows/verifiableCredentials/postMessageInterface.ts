@@ -1,9 +1,10 @@
 import { toast } from "$src/components/toast";
-import type {
+import {
+  VcFlowReady,
+  VcFlowRequest,
   VcResponse,
   VcVerifiablePresentation,
 } from "@dfinity/internet-identity-vc-api";
-import { VcFlowReady, VcFlowRequest } from "@dfinity/internet-identity-vc-api";
 
 export type { VcVerifiablePresentation } from "@dfinity/internet-identity-vc-api";
 
@@ -71,6 +72,11 @@ const waitForRequest = (): Promise<{
 }> => {
   return new Promise((resolve) => {
     const messageEventHandler = (evnt: MessageEvent) => {
+      if (evnt.origin === window.location.origin) {
+        // Ignore messages from own origin (e.g. from browser extensions)
+        console.warn("Ignoring message from own origin", evnt);
+        return;
+      }
       const message: unknown = evnt.data;
       const result = VcFlowRequest.safeParse(message);
 
